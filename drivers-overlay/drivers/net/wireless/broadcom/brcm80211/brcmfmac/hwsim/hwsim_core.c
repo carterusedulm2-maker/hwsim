@@ -566,6 +566,13 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 		return 0;
 	}
 
+	if (strcmp(iovar, "qtxpower") == 0) {
+		/* Report 20 dBm (qdbm = dBm * 4) */
+		__le32 val = cpu_to_le32(80);
+		hwsim_build_ok(dev, req, &val, sizeof(val));
+		return 0;
+	}
+
 	if (strcmp(iovar, "nmode") == 0 || strcmp(iovar, "vhtmode") == 0) {
 		__le32 val = cpu_to_le32(1);
 		hwsim_build_ok(dev, req, &val, sizeof(val));
