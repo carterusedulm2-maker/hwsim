@@ -1,0 +1,46 @@
+From 078fbc57ed4ff86fc8192d752a39fcbecf1a429d Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 06:53:38 +0800
+Subject: [PATCH 04/11] brcmfmac: hook sim_sdio register/exit into core
+ init/exit
+
+Add brcmf_sim_sdio_register() and brcmf_sim_sdio_exit() calls to
+brcmf_core_init() and brcmf_core_exit() respectively, with proper
+error unwinding in the init path.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+index 20ab9b1ee..55f47580a 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/core.c
+@@ -1551,8 +1551,15 @@ int __init brcmf_core_init(void)
+ 	err = brcmf_pcie_register();
+ 	if (err)
+ 		goto error_pcie_register;
++
++	err = brcmf_sim_sdio_register();
++	if (err)
++		goto error_sim_sdio_register;
++
+ 	return 0;
+ 
++error_sim_sdio_register:
++	brcmf_pcie_exit();
+ error_pcie_register:
+ 	brcmf_usb_exit();
+ error_usb_register:
+@@ -1562,6 +1569,7 @@ int __init brcmf_core_init(void)
+ 
+ void __exit brcmf_core_exit(void)
+ {
++	brcmf_sim_sdio_exit();
+ 	brcmf_sdio_exit();
+ 	brcmf_usb_exit();
+ 	brcmf_pcie_exit();
+-- 
+2.50.1 (Apple Git-155)
+

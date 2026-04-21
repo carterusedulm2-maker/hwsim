@@ -1,0 +1,109 @@
+From 3b4728d6848436a87125bb0c27f75f9cfd7807ce Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Tue, 21 Apr 2026 21:44:36 +0800
+Subject: [PATCH 10/11] brcmfmac/hwsim: fix compile errors found during arm64
+ VM validation
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five real bugs caught by first successful kernel build on Ubuntu 24.04 arm64
+(OrbStack VM), all in hwsim_core.c:
+
+1. Missing #include "core.h" — struct brcmf_if was forward-declared inside
+   fwil.h's static inlines, causing incompatible-pointer-type errors.
+2. struct brcmf_wlc_version_le has no member epi_ver.epi_major — it's a
+   flat struct with fields named epi_ver_major, etc. Also added wlc_ver_major.
+3. hwsim_build_response() called with 5 args instead of 6 (missing error flag).
+4. debugfs_create_s32() does not exist in kernel 6.12 — only _u32 variant.
+   Changed force_ioctl_error / force_txdata_error from s32 to u32 and cast
+   at the sign-negation site.
+5. Format specifier %d for u32 changed to %u in seq_printf.
+
+Build verified on Linux 6.12.81 arm64:
+- hwsim_core.o, brcmfmac_hwsim.o, sim_sdio.o all link cleanly
+- 0 warnings, 0 errors from our files
+- All fixes are straight-forward mechanical corrections
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 20 ++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index de2d98840..483855d4e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -23,6 +23,7 @@
+ #include <linux/seq_file.h>
+ 
+ #include <brcmu_wifi.h>
++#include "core.h"
+ #include "fwil.h"
+ #include "fwil_types.h"
+ #include "fweh.h"
+@@ -131,8 +132,8 @@ struct hwsim_dev {
+ 
+ 	/* Fault injection state (Phase 17) */
+ 	struct {
+-		s32 force_ioctl_error;   /* non-zero → all ioctls return this BCME code */
+-		s32 force_txdata_error;  /* non-zero → tx_data returns this Linux errno */
++		u32 force_ioctl_error;   /* non-zero → all ioctls return this BCME code */
++		u32 force_txdata_error;  /* non-zero → tx_data returns this Linux errno (positive) */
+ 		u32 drop_events;         /* bitmask: 1=drop scan, 2=drop connect, 4=drop AP */
+ 		u32 ctl_delay_ms;        /* extra delay before ctrl response (0=none) */
+ 		u32 txdata_drop_pct;     /* percentage of TX data to drop (0-100) */
+@@ -505,7 +506,8 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 
+ 		ver.version = cpu_to_le16(1);
+ 		ver.length = cpu_to_le16(sizeof(ver));
+-		ver.epi_ver.epi_major = 1;
++		ver.epi_ver_major = cpu_to_le16(1);
++		ver.wlc_ver_major = cpu_to_le16(1);
+ 		hwsim_build_ok(dev, req, &ver, sizeof(ver));
+ 		return 0;
+ 	}
+@@ -899,7 +901,7 @@ static int hwsim_tx_ctl(void *ctx, u8 *msg, uint len)
+ 	/* Fault injection: force all ioctls to return an error code */
+ 	if (dev->fi.force_ioctl_error) {
+ 		hwsim_build_response(dev, dcmd, NULL, 0,
+-				     dev->fi.force_ioctl_error);
++				     dev->fi.force_ioctl_error, true);
+ 		mutex_unlock(&dev->lock);
+ 		goto signal;
+ 	}
+@@ -952,7 +954,7 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
+ 
+ 	/* Fault injection: force TX error */
+ 	if (dev->fi.force_txdata_error)
+-		return -dev->fi.force_txdata_error;
++		return -(int)dev->fi.force_txdata_error;
+ 
+ 	/* Fault injection: probabilistic TX drop */
+ 	if (dev->fi.txdata_drop_pct &&
+@@ -1107,8 +1109,8 @@ static int hwsim_state_show(struct seq_file *s, void *unused)
+ 	seq_printf(s, "cb_registered: %s\n", dev->cb_registered ? "yes" : "no");
+ 	seq_printf(s, "detached:   %s\n", dev->detached ? "yes" : "no");
+ 	seq_printf(s, "\n--- fault injection ---\n");
+-	seq_printf(s, "force_ioctl_error: %d\n", dev->fi.force_ioctl_error);
+-	seq_printf(s, "force_txdata_error: %d\n", dev->fi.force_txdata_error);
++	seq_printf(s, "force_ioctl_error: %u\n", dev->fi.force_ioctl_error);
++	seq_printf(s, "force_txdata_error: %u\n", dev->fi.force_txdata_error);
+ 	seq_printf(s, "drop_events: 0x%x\n", dev->fi.drop_events);
+ 	seq_printf(s, "ctl_delay_ms: %u\n", dev->fi.ctl_delay_ms);
+ 	seq_printf(s, "txdata_drop_pct: %u\n", dev->fi.txdata_drop_pct);
+@@ -1136,9 +1138,9 @@ static void hwsim_debugfs_create(struct hwsim_dev *dev)
+ 	dev->debugfs_dir = dir;
+ 
+ 	/* Fault injection knobs */
+-	debugfs_create_s32("force_ioctl_error", 0644, dir,
++	debugfs_create_u32("force_ioctl_error", 0644, dir,
+ 			   &dev->fi.force_ioctl_error);
+-	debugfs_create_s32("force_txdata_error", 0644, dir,
++	debugfs_create_u32("force_txdata_error", 0644, dir,
+ 			   &dev->fi.force_txdata_error);
+ 	debugfs_create_u32("drop_events", 0644, dir, &dev->fi.drop_events);
+ 	debugfs_create_u32("ctl_delay_ms", 0644, dir, &dev->fi.ctl_delay_ms);
+-- 
+2.50.1 (Apple Git-155)
+

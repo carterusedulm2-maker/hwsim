@@ -1,0 +1,528 @@
+From 487ceef9c692fc7709f8aa050576359e98f6274e Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 07:09:09 +0800
+Subject: [PATCH 09/11] brcmfmac_hwsim: add 3-tier integration test suite
+
+Phase 18: Shell-based test suite with 3 tiers:
+
+Tier 1 (Smoke): Module load/unload, interface creation, MAC check,
+interface up/down, debugfs existence and readability.
+
+Tier 2 (Integration): Debugfs counter verification, fault injection
+knob read/write, module reload cycle (5x), wrong load order
+detection, wpa_supplicant start/scan, scan event dropping.
+
+Tier 3 (Stress): Rapid load/unload (20x), debugfs hammer (100x
+random reads/writes), interface toggle (50x), final KASAN/warning/
+oops health check.
+
+Usage: sudo ./run_tests.sh [--quick|--full|--stress]
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcmfmac/hwsim/tests/run_tests.sh         | 493 ++++++++++++++++++
+ 1 file changed, 493 insertions(+)
+ create mode 100755 drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/tests/run_tests.sh
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/tests/run_tests.sh b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/tests/run_tests.sh
+new file mode 100755
+index 000000000..2b6ee2d7c
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/tests/run_tests.sh
+@@ -0,0 +1,493 @@
++#!/bin/bash
++# SPDX-License-Identifier: ISC
++#
++# brcmfmac_hwsim integration test suite
++#
++# Runs on the target x86_64 machine after kernel modules are built.
++# Tests module load/unload, interface creation, wpa_supplicant
++# integration, fault injection, and stress scenarios.
++#
++# Usage:
++#   sudo ./run_tests.sh [--quick]       # quick smoke test
++#   sudo ./run_tests.sh [--full]        # full test suite (default)
++#   sudo ./run_tests.sh [--stress]      # full + stress tests
++#
++# Prerequisites:
++#   - Kernel built with CONFIG_BRCMFMAC_HWSIM_SDIO=y
++#   - brcmfmac_hwsim.ko built as external module
++#   - wpa_supplicant installed (for integration tests)
++#   - debugfs mounted at /sys/kernel/debug
++#
++# Exit codes:
++#   0 = all tests passed
++#   1 = test failure
++#   2 = prerequisite missing
++
++set -euo pipefail
++
++# ── Configuration ──────────────────────────────────────────────
++HWSIM_MODULE="brcmfmac_hwsim"
++BRCMFMAC_MODULE="brcmfmac"
++WCC_MODULE="brcmfmac-wcc"
++DEBUGFS="/sys/kernel/debug/brcmfmac_hwsim"
++IFACE="wlan0"
++TEST_MODE="${1:---full}"
++
++# ── Counters ──────────────────────────────────────────────────
++PASS=0
++FAIL=0
++SKIP=0
++TOTAL=0
++
++# ── Colors ────────────────────────────────────────────────────
++RED='\033[0;31m'
++GREEN='\033[0;32m'
++YELLOW='\033[0;33m'
++CYAN='\033[0;36m'
++NC='\033[0m'
++
++# ── Helper functions ──────────────────────────────────────────
++
++log_info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
++log_pass()  { echo -e "${GREEN}[PASS]${NC} $*"; PASS=$((PASS+1)); TOTAL=$((TOTAL+1)); }
++log_fail()  { echo -e "${RED}[FAIL]${NC} $*"; FAIL=$((FAIL+1)); TOTAL=$((TOTAL+1)); }
++log_skip()  { echo -e "${YELLOW}[SKIP]${NC} $*"; SKIP=$((SKIP+1)); TOTAL=$((TOTAL+1)); }
++
++run_test() {
++    local name="$1"
++    shift
++    log_info "Running: $name"
++    if "$@"; then
++        log_pass "$name"
++    else
++        log_fail "$name"
++    fi
++}
++
++check_root() {
++    if [ "$(id -u)" -ne 0 ]; then
++        echo "ERROR: Must run as root (sudo)" >&2
++        exit 2
++    fi
++}
++
++check_prereqs() {
++    local ok=true
++
++    if ! modinfo "$HWSIM_MODULE" &>/dev/null; then
++        echo "ERROR: $HWSIM_MODULE module not found" >&2
++        ok=false
++    fi
++
++    if ! grep -q "CONFIG_BRCMFMAC_HWSIM_SDIO=y" /boot/config-"$(uname -r)" 2>/dev/null && \
++       ! zgrep -q "CONFIG_BRCMFMAC_HWSIM_SDIO=y" /proc/config.gz 2>/dev/null; then
++        echo "WARNING: Cannot verify CONFIG_BRCMFMAC_HWSIM_SDIO=y in running kernel"
++    fi
++
++    if ! mountpoint -q /sys/kernel/debug 2>/dev/null; then
++        mount -t debugfs none /sys/kernel/debug 2>/dev/null || true
++    fi
++
++    if [ "$ok" = false ]; then
++        exit 2
++    fi
++}
++
++# Ensure clean state before/between tests
++cleanup_modules() {
++    # Remove in reverse order
++    rmmod "$BRCMFMAC_MODULE" 2>/dev/null || true
++    rmmod "$HWSIM_MODULE" 2>/dev/null || true
++    rmmod "$WCC_MODULE" 2>/dev/null || true
++    sleep 0.5
++}
++
++# Load the full module stack
++load_modules() {
++    modprobe "$WCC_MODULE" 2>/dev/null || insmod "$(modinfo -n $WCC_MODULE 2>/dev/null || true)" 2>/dev/null || true
++    insmod "$(modinfo -n $HWSIM_MODULE)"
++    modprobe "$BRCMFMAC_MODULE" 2>/dev/null || insmod "$(modinfo -n $BRCMFMAC_MODULE)"
++    sleep 2
++}
++
++# ── Test: Module load/unload ──────────────────────────────────
++
++test_module_load() {
++    cleanup_modules
++    load_modules
++    # Verify hwsim module loaded
++    lsmod | grep -q "$HWSIM_MODULE"
++}
++
++test_module_unload() {
++    cleanup_modules
++    # All should unload cleanly
++    ! lsmod | grep -q "$HWSIM_MODULE"
++}
++
++test_module_load_order_wrong() {
++    # Try loading brcmfmac before hwsim — should fail gracefully
++    cleanup_modules
++    modprobe "$WCC_MODULE" 2>/dev/null || true
++    modprobe "$BRCMFMAC_MODULE" 2>/dev/null || insmod "$(modinfo -n $BRCMFMAC_MODULE)" 2>/dev/null
++    # brcmfmac may load but wlan0 should NOT appear (no hwsim)
++    sleep 1
++    ! ip link show "$IFACE" &>/dev/null
++}
++
++test_module_reload_cycle() {
++    local i
++    for i in 1 2 3 4 5; do
++        cleanup_modules
++        load_modules
++        if ! ip link show "$IFACE" &>/dev/null; then
++            return 1
++        fi
++    done
++    cleanup_modules
++    return 0
++}
++
++# ── Test: Interface creation ──────────────────────────────────
++
++test_interface_created() {
++    cleanup_modules
++    load_modules
++    ip link show "$IFACE" &>/dev/null
++}
++
++test_interface_mac_addr() {
++    local mac
++    mac=$(ip link show "$IFACE" 2>/dev/null | awk '/link\/ether/{print $2}')
++    # Should be 02:00:00:48:53:00 (HWSIM_MAC_ADDR)
++    [ "$mac" = "02:00:00:48:53:00" ]
++}
++
++test_interface_up() {
++    ip link set "$IFACE" up
++    sleep 0.5
++    ip link show "$IFACE" | grep -q "UP"
++}
++
++test_interface_down_up_cycle() {
++    local i
++    for i in 1 2 3; do
++        ip link set "$IFACE" down
++        sleep 0.2
++        ip link set "$IFACE" up
++        sleep 0.5
++    done
++    ip link show "$IFACE" | grep -q "UP"
++}
++
++# ── Test: Debugfs ─────────────────────────────────────────────
++
++test_debugfs_exists() {
++    [ -d "$DEBUGFS" ]
++}
++
++test_debugfs_state_readable() {
++    cat "$DEBUGFS/state" | grep -q "fw_state:"
++}
++
++test_debugfs_counters_zero() {
++    [ "$(cat $DEBUGFS/tx_count)" = "0" ] &&
++    [ "$(cat $DEBUGFS/ctl_count)" != "0" ]  # should have had some ctl from probe
++}
++
++test_debugfs_force_ioctl_error() {
++    # Set force_ioctl_error to -23 (BCME_UNSUPPORTED)
++    echo "-23" > "$DEBUGFS/force_ioctl_error"
++    local val
++    val=$(cat "$DEBUGFS/force_ioctl_error")
++    [ "$val" = "-23" ]
++    # Reset
++    echo "0" > "$DEBUGFS/force_ioctl_error"
++}
++
++test_debugfs_drop_events() {
++    echo "3" > "$DEBUGFS/drop_events"
++    local val
++    val=$(cat "$DEBUGFS/drop_events")
++    [ "$val" = "3" ]
++    echo "0" > "$DEBUGFS/drop_events"
++}
++
++test_debugfs_ctl_delay() {
++    echo "100" > "$DEBUGFS/ctl_delay_ms"
++    local val
++    val=$(cat "$DEBUGFS/ctl_delay_ms")
++    [ "$val" = "100" ]
++    echo "0" > "$DEBUGFS/ctl_delay_ms"
++}
++
++# ── Test: wpa_supplicant integration ──────────────────────────
++
++test_wpa_supplicant_start() {
++    if ! command -v wpa_supplicant &>/dev/null; then
++        log_skip "wpa_supplicant not installed"
++        return 0
++    fi
++
++    # Create a minimal config
++    local conf
++    conf=$(mktemp /tmp/wpa_hwsim_XXXXXX.conf)
++    cat > "$conf" <<EOF
++ctrl_interface=/var/run/wpa_supplicant
++ctrl_interface_group=0
++update_config=1
++EOF
++
++    ip link set "$IFACE" up
++    sleep 0.5
++
++    # Start wpa_supplicant in background
++    wpa_supplicant -B -i "$IFACE" -c "$conf" -D nl80211 -P /tmp/wpa_hwsim.pid
++    sleep 2
++
++    # Check it's running
++    local running=false
++    if [ -f /tmp/wpa_hwsim.pid ] && kill -0 "$(cat /tmp/wpa_hwsim.pid)" 2>/dev/null; then
++        running=true
++    fi
++
++    # Cleanup
++    if [ -f /tmp/wpa_hwsim.pid ]; then
++        kill "$(cat /tmp/wpa_hwsim.pid)" 2>/dev/null || true
++        rm -f /tmp/wpa_hwsim.pid
++    fi
++    rm -f "$conf"
++
++    [ "$running" = true ]
++}
++
++test_wpa_supplicant_scan() {
++    if ! command -v wpa_supplicant &>/dev/null || ! command -v wpa_cli &>/dev/null; then
++        log_skip "wpa_supplicant/wpa_cli not installed"
++        return 0
++    fi
++
++    local conf
++    conf=$(mktemp /tmp/wpa_hwsim_XXXXXX.conf)
++    cat > "$conf" <<EOF
++ctrl_interface=/var/run/wpa_supplicant
++update_config=1
++EOF
++
++    ip link set "$IFACE" up
++    wpa_supplicant -B -i "$IFACE" -c "$conf" -D nl80211 -P /tmp/wpa_hwsim.pid
++    sleep 2
++
++    # Trigger scan
++    wpa_cli -i "$IFACE" scan
++    sleep 3
++
++    # Get scan results
++    local results
++    results=$(wpa_cli -i "$IFACE" scan_results 2>/dev/null || true)
++
++    # Cleanup
++    if [ -f /tmp/wpa_hwsim.pid ]; then
++        kill "$(cat /tmp/wpa_hwsim.pid)" 2>/dev/null || true
++        rm -f /tmp/wpa_hwsim.pid
++    fi
++    rm -f "$conf"
++
++    # Should see HWSIM-AP in results
++    echo "$results" | grep -qi "HWSIM"
++}
++
++# ── Test: Fault injection integration ─────────────────────────
++
++test_fault_scan_drop() {
++    if ! command -v wpa_cli &>/dev/null; then
++        log_skip "wpa_cli not installed"
++        return 0
++    fi
++
++    # Enable scan event dropping
++    echo "1" > "$DEBUGFS/drop_events"
++
++    local conf
++    conf=$(mktemp /tmp/wpa_hwsim_XXXXXX.conf)
++    cat > "$conf" <<EOF
++ctrl_interface=/var/run/wpa_supplicant
++update_config=1
++EOF
++
++    ip link set "$IFACE" up
++    wpa_supplicant -B -i "$IFACE" -c "$conf" -D nl80211 -P /tmp/wpa_hwsim.pid
++    sleep 2
++
++    wpa_cli -i "$IFACE" scan
++    sleep 3
++
++    local results
++    results=$(wpa_cli -i "$IFACE" scan_results 2>/dev/null || true)
++
++    # Cleanup
++    echo "0" > "$DEBUGFS/drop_events"
++    if [ -f /tmp/wpa_hwsim.pid ]; then
++        kill "$(cat /tmp/wpa_hwsim.pid)" 2>/dev/null || true
++        rm -f /tmp/wpa_hwsim.pid
++    fi
++    rm -f "$conf"
++
++    # With events dropped, should NOT see HWSIM-AP
++    ! echo "$results" | grep -qi "HWSIM"
++}
++
++# ── Test: Stress tests ────────────────────────────────────────
++
++test_stress_rapid_load_unload() {
++    local i
++    for i in $(seq 1 20); do
++        cleanup_modules
++        load_modules
++        if ! lsmod | grep -q "$HWSIM_MODULE"; then
++            return 1
++        fi
++    done
++    cleanup_modules
++    return 0
++}
++
++test_stress_debugfs_hammer() {
++    cleanup_modules
++    load_modules
++
++    local i
++    for i in $(seq 1 100); do
++        cat "$DEBUGFS/state" > /dev/null 2>&1
++        cat "$DEBUGFS/tx_count" > /dev/null 2>&1
++        echo "$((RANDOM % 100))" > "$DEBUGFS/txdata_drop_pct" 2>/dev/null
++        echo "0" > "$DEBUGFS/txdata_drop_pct" 2>/dev/null
++    done
++    return 0
++}
++
++test_stress_interface_toggle() {
++    local i
++    for i in $(seq 1 50); do
++        ip link set "$IFACE" up 2>/dev/null || true
++        ip link set "$IFACE" down 2>/dev/null || true
++    done
++    ip link set "$IFACE" up
++    sleep 0.5
++    ip link show "$IFACE" | grep -q "UP"
++}
++
++# ── Test: KASAN / error detection ─────────────────────────────
++
++test_no_kasan_errors() {
++    # Check dmesg for KASAN reports after our operations
++    ! dmesg | tail -200 | grep -qi "KASAN"
++}
++
++test_no_kernel_warnings() {
++    ! dmesg | tail -200 | grep -qi "WARNING.*brcmfmac"
++}
++
++test_no_kernel_oops() {
++    ! dmesg | tail -200 | grep -qi "Oops\|BUG\|kernel panic"
++}
++
++# ── Main test runner ──────────────────────────────────────────
++
++main() {
++    check_root
++    check_prereqs
++
++    echo ""
++    echo "=========================================="
++    echo " brcmfmac_hwsim Integration Test Suite"
++    echo " Mode: $TEST_MODE"
++    echo "=========================================="
++    echo ""
++
++    # ── Tier 1: Basic functionality ──
++    log_info "=== Tier 1: Module & Interface ==="
++
++    run_test "T01: Module load" test_module_load
++    run_test "T02: Interface created" test_interface_created
++    run_test "T03: Interface MAC address" test_interface_mac_addr
++    run_test "T04: Interface up" test_interface_up
++    run_test "T05: Interface down/up cycle" test_interface_down_up_cycle
++    run_test "T06: Debugfs exists" test_debugfs_exists
++    run_test "T07: Debugfs state readable" test_debugfs_state_readable
++
++    if [ "$TEST_MODE" = "--quick" ]; then
++        run_test "T08: Module unload" test_module_unload
++        goto_summary
++        return
++    fi
++
++    # ── Tier 2: Integration ──
++    log_info ""
++    log_info "=== Tier 2: Integration ==="
++
++    run_test "T08: Debugfs counters" test_debugfs_counters_zero
++    run_test "T09: Debugfs force_ioctl_error" test_debugfs_force_ioctl_error
++    run_test "T10: Debugfs drop_events" test_debugfs_drop_events
++    run_test "T11: Debugfs ctl_delay" test_debugfs_ctl_delay
++    run_test "T12: Module reload cycle (5x)" test_module_reload_cycle
++
++    # Reload for wpa tests
++    cleanup_modules
++    load_modules
++
++    run_test "T13: Wrong load order" test_module_load_order_wrong
++    cleanup_modules
++    load_modules
++
++    run_test "T14: wpa_supplicant start" test_wpa_supplicant_start
++    run_test "T15: wpa_supplicant scan" test_wpa_supplicant_scan
++    run_test "T16: Fault inject: scan drop" test_fault_scan_drop
++
++    if [ "$TEST_MODE" != "--stress" ]; then
++        # Cleanup and kernel health check
++        run_test "T17: No KASAN errors" test_no_kasan_errors
++        run_test "T18: No kernel warnings" test_no_kernel_warnings
++        run_test "T19: No kernel oops" test_no_kernel_oops
++        run_test "T20: Clean module unload" test_module_unload
++        goto_summary
++        return
++    fi
++
++    # ── Tier 3: Stress ──
++    log_info ""
++    log_info "=== Tier 3: Stress Tests ==="
++
++    run_test "T17: Rapid load/unload (20x)" test_stress_rapid_load_unload
++    cleanup_modules
++    load_modules
++
++    run_test "T18: Debugfs hammer (100x)" test_stress_debugfs_hammer
++    run_test "T19: Interface toggle (50x)" test_stress_interface_toggle
++
++    # Final health check
++    log_info ""
++    log_info "=== Final Health Check ==="
++
++    run_test "T20: No KASAN errors" test_no_kasan_errors
++    run_test "T21: No kernel warnings" test_no_kernel_warnings
++    run_test "T22: No kernel oops" test_no_kernel_oops
++    run_test "T23: Clean module unload" test_module_unload
++
++    goto_summary
++}
++
++goto_summary() {
++    echo ""
++    echo "=========================================="
++    echo -e " Results: ${GREEN}${PASS} passed${NC}, ${RED}${FAIL} failed${NC}, ${YELLOW}${SKIP} skipped${NC} / ${TOTAL} total"
++    echo "=========================================="
++    echo ""
++
++    if [ "$FAIL" -gt 0 ]; then
++        exit 1
++    fi
++    exit 0
++}
++
++main "$@"
+-- 
+2.50.1 (Apple Git-155)
+

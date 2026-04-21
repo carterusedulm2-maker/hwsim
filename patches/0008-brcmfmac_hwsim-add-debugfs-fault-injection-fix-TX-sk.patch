@@ -1,0 +1,294 @@
+From c4215b3d781a490740a1846b434c214bde977dda Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 07:07:39 +0800
+Subject: [PATCH 08/11] brcmfmac_hwsim: add debugfs fault injection + fix TX
+ skb ownership
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 17: Add debugfs interface at /sys/kernel/debug/brcmfmac_hwsim/
+
+Fault injection knobs (read-write):
+- force_ioctl_error: BCME_* code to force all ioctls to fail
+- force_txdata_error: Linux errno to force TX data failure
+- drop_events: bitmask (1=scan, 2=connect, 4=AP events)
+- ctl_delay_ms: extra delay before control responses
+- txdata_drop_pct: percentage of TX frames to drop (0-100)
+
+Read-only counters:
+- tx_count, rx_count, ctl_count, event_count
+- state: composite view of firmware + fault injection state
+
+Also fix TX data path skb ownership:
+- Remove kfree_skb(skb) from hwsim_tx_data() — the bus shim
+  retains ownership of the original skb and passes it to
+  brcmf_proto_bcdc_txcomplete(). hwsim only clones via skb_copy().
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 167 +++++++++++++++++-
+ 1 file changed, 162 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index c54d3bf8a..de2d98840 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -19,6 +19,8 @@
+ #include <linux/if_ether.h>
+ #include <linux/mutex.h>
+ #include <linux/jiffies.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
+ 
+ #include <brcmu_wifi.h>
+ #include "fwil.h"
+@@ -126,6 +128,21 @@ struct hwsim_dev {
+ 	struct delayed_work scan_work;
+ 	struct delayed_work connect_work;
+ 	struct workqueue_struct *wq;
++
++	/* Fault injection state (Phase 17) */
++	struct {
++		s32 force_ioctl_error;   /* non-zero → all ioctls return this BCME code */
++		s32 force_txdata_error;  /* non-zero → tx_data returns this Linux errno */
++		u32 drop_events;         /* bitmask: 1=drop scan, 2=drop connect, 4=drop AP */
++		u32 ctl_delay_ms;        /* extra delay before ctrl response (0=none) */
++		u32 txdata_drop_pct;     /* percentage of TX data to drop (0-100) */
++		u32 tx_count;            /* cumulative TX data count */
++		u32 rx_count;            /* cumulative RX data count */
++		u32 ctl_count;           /* cumulative control transactions */
++		u32 event_count;         /* cumulative events generated */
++	} fi;
++
++	struct dentry *debugfs_dir;
+ };
+ 
+ /* Global device instance (Milestone 1: single device) */
+@@ -304,6 +321,14 @@ static void hwsim_scan_work_fn(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	/* Fault injection: drop scan events (bit 0) */
++	if (dev->fi.drop_events & 0x01) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++
++	dev->fi.event_count++;
++
+ 	/* Partial result with 1 BSS */
+ 	bss_len = offsetof(struct brcmf_bss_info_le, basic_mcs) +
+ 		  BRCMF_MCSSET_LEN + sizeof(ie_data);
+@@ -387,6 +412,13 @@ static void hwsim_connect_work_fn(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	/* Fault injection: drop connect events (bit 1) */
++	if (dev->fi.drop_events & 0x02) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++
++	dev->fi.event_count++;
+ 	dev->associated = true;
+ 
+ 	/* Send BRCMF_E_LINK with LINK flag set */
+@@ -849,6 +881,12 @@ static int hwsim_tx_ctl(void *ctx, u8 *msg, uint len)
+ 	if (len < sizeof(*dcmd))
+ 		return -EINVAL;
+ 
++	/* Fault injection: extra control path delay */
++	if (dev->fi.ctl_delay_ms)
++		msleep(dev->fi.ctl_delay_ms);
++
++	dev->fi.ctl_count++;
++
+ 	dcmd = (struct hwsim_bcdc_dcmd *)msg;
+ 	payload = msg + sizeof(*dcmd);
+ 	payload_len = len - sizeof(*dcmd);
+@@ -858,10 +896,19 @@ static int hwsim_tx_ctl(void *ctx, u8 *msg, uint len)
+ 	mutex_lock(&dev->lock);
+ 	dev->resp_ready = false;
+ 
++	/* Fault injection: force all ioctls to return an error code */
++	if (dev->fi.force_ioctl_error) {
++		hwsim_build_response(dev, dcmd, NULL, 0,
++				     dev->fi.force_ioctl_error);
++		mutex_unlock(&dev->lock);
++		goto signal;
++	}
++
+ 	hwsim_handle_cmd(dev, dcmd, payload, payload_len, is_set);
+ 
+ 	mutex_unlock(&dev->lock);
+ 
++signal:
+ 	/* Signal response ready to bus shim */
+ 	if (dev->cb_registered && dev->cb && dev->cb->rx_ctl_ready && !dev->detached)
+ 		dev->cb->rx_ctl_ready(dev->cb_ctx);
+@@ -898,18 +945,27 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
+ 	struct sk_buff *rx_skb;
+ 	u8 *bcdc_hdr;
+ 
+-	if (!dev || dev->fw_state != HWSIM_FW_BOOTED) {
+-		kfree_skb(skb);
++	if (!dev || dev->fw_state != HWSIM_FW_BOOTED)
+ 		return -ENODEV;
+-	}
++
++	dev->fi.tx_count++;
++
++	/* Fault injection: force TX error */
++	if (dev->fi.force_txdata_error)
++		return -dev->fi.force_txdata_error;
++
++	/* Fault injection: probabilistic TX drop */
++	if (dev->fi.txdata_drop_pct &&
++	    (get_random_u32() % 100) < dev->fi.txdata_drop_pct)
++		return 0; /* silently drop */
+ 
+ 	/*
+ 	 * Loopback: clone the skb, rewrite the BCDC header for RX,
+ 	 * and deliver back via rx_data callback.
++	 * The original skb is NOT freed — the bus shim retains ownership
++	 * and will pass it to brcmf_proto_bcdc_txcomplete().
+ 	 */
+ 	rx_skb = skb_copy(skb, GFP_KERNEL);
+-	kfree_skb(skb);
+-
+ 	if (!rx_skb)
+ 		return -ENOMEM;
+ 
+@@ -922,6 +978,7 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
+ 		/* ifidx stays the same for loopback */
+ 	}
+ 
++	dev->fi.rx_count++;
+ 	hwsim_send_event(dev, rx_skb);
+ 	return 0;
+ }
+@@ -1012,6 +1069,102 @@ EXPORT_SYMBOL_GPL(brcmf_hwsim_get_ops);
+  * Module init/exit
+  * ====================================================================== */
+ 
++/* ======================================================================
++ * Debugfs fault injection interface (Phase 17)
++ *
++ * Directory: /sys/kernel/debug/brcmfmac_hwsim/
++ *
++ * Writable files (fault injection):
++ *   force_ioctl_error  - Set to BCME_* code to make all ioctls fail
++ *   force_txdata_error - Set to Linux errno (positive) to make TX fail
++ *   drop_events        - Bitmask: 1=scan, 2=connect, 4=AP events
++ *   ctl_delay_ms       - Extra delay (ms) before control responses
++ *   txdata_drop_pct    - Percentage of TX data to drop (0-100)
++ *
++ * Read-only files (counters):
++ *   tx_count           - Cumulative TX data frames
++ *   rx_count           - Cumulative RX data frames
++ *   ctl_count          - Cumulative control transactions
++ *   event_count        - Cumulative firmware events generated
++ *   state              - Virtual firmware state summary
++ * ====================================================================== */
++
++static struct dentry *hwsim_debugfs_root;
++
++static int hwsim_state_show(struct seq_file *s, void *unused)
++{
++	struct hwsim_dev *dev = s->private;
++
++	mutex_lock(&dev->lock);
++	seq_printf(s, "fw_state:   %s\n",
++		   dev->fw_state == HWSIM_FW_BOOTED ? "BOOTED" : "OFF");
++	seq_printf(s, "mode:       %s\n",
++		   dev->mode == HWSIM_MODE_AP ? "AP" : "STA");
++	seq_printf(s, "mac:        %pM\n", dev->mac_addr);
++	seq_printf(s, "country:    %.2s\n", dev->country);
++	seq_printf(s, "associated: %s\n", dev->associated ? "yes" : "no");
++	seq_printf(s, "ap_started: %s\n", dev->ap_started ? "yes" : "no");
++	seq_printf(s, "cb_registered: %s\n", dev->cb_registered ? "yes" : "no");
++	seq_printf(s, "detached:   %s\n", dev->detached ? "yes" : "no");
++	seq_printf(s, "\n--- fault injection ---\n");
++	seq_printf(s, "force_ioctl_error: %d\n", dev->fi.force_ioctl_error);
++	seq_printf(s, "force_txdata_error: %d\n", dev->fi.force_txdata_error);
++	seq_printf(s, "drop_events: 0x%x\n", dev->fi.drop_events);
++	seq_printf(s, "ctl_delay_ms: %u\n", dev->fi.ctl_delay_ms);
++	seq_printf(s, "txdata_drop_pct: %u\n", dev->fi.txdata_drop_pct);
++	seq_printf(s, "\n--- counters ---\n");
++	seq_printf(s, "tx_count: %u\n", dev->fi.tx_count);
++	seq_printf(s, "rx_count: %u\n", dev->fi.rx_count);
++	seq_printf(s, "ctl_count: %u\n", dev->fi.ctl_count);
++	seq_printf(s, "event_count: %u\n", dev->fi.event_count);
++	mutex_unlock(&dev->lock);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(hwsim_state);
++
++static void hwsim_debugfs_create(struct hwsim_dev *dev)
++{
++	struct dentry *dir;
++
++	hwsim_debugfs_root = debugfs_create_dir("brcmfmac_hwsim", NULL);
++	if (IS_ERR_OR_NULL(hwsim_debugfs_root)) {
++		hwsim_debugfs_root = NULL;
++		return;
++	}
++	dir = hwsim_debugfs_root;
++	dev->debugfs_dir = dir;
++
++	/* Fault injection knobs */
++	debugfs_create_s32("force_ioctl_error", 0644, dir,
++			   &dev->fi.force_ioctl_error);
++	debugfs_create_s32("force_txdata_error", 0644, dir,
++			   &dev->fi.force_txdata_error);
++	debugfs_create_u32("drop_events", 0644, dir, &dev->fi.drop_events);
++	debugfs_create_u32("ctl_delay_ms", 0644, dir, &dev->fi.ctl_delay_ms);
++	debugfs_create_u32("txdata_drop_pct", 0644, dir,
++			   &dev->fi.txdata_drop_pct);
++
++	/* Read-only counters */
++	debugfs_create_u32("tx_count", 0444, dir, &dev->fi.tx_count);
++	debugfs_create_u32("rx_count", 0444, dir, &dev->fi.rx_count);
++	debugfs_create_u32("ctl_count", 0444, dir, &dev->fi.ctl_count);
++	debugfs_create_u32("event_count", 0444, dir, &dev->fi.event_count);
++
++	/* Composite state file */
++	debugfs_create_file("state", 0444, dir, dev, &hwsim_state_fops);
++}
++
++static void hwsim_debugfs_remove(void)
++{
++	debugfs_remove_recursive(hwsim_debugfs_root);
++	hwsim_debugfs_root = NULL;
++}
++
++/* ======================================================================
++ * Device alloc / free
++ * ====================================================================== */
++
+ static struct hwsim_dev *hwsim_dev_alloc(void)
+ {
+ 	struct hwsim_dev *dev;
+@@ -1062,6 +1215,8 @@ static int __init brcmfmac_hwsim_init(void)
+ 	hwsim_device = dev;
+ 	mutex_unlock(&hwsim_global_lock);
+ 
++	hwsim_debugfs_create(dev);
++
+ 	pr_info("brcmfmac_hwsim: module loaded (virtual firmware ready)\n");
+ 	return 0;
+ }
+@@ -1070,6 +1225,8 @@ static void __exit brcmfmac_hwsim_exit(void)
+ {
+ 	struct hwsim_dev *dev;
+ 
++	hwsim_debugfs_remove();
++
+ 	mutex_lock(&hwsim_global_lock);
+ 	dev = hwsim_device;
+ 	hwsim_device = NULL;
+-- 
+2.50.1 (Apple Git-155)
+

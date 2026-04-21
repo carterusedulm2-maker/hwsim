@@ -1,0 +1,59 @@
+From a92a08bd8cf501a140ad1296947eed2c4df02c92 Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 06:52:49 +0800
+Subject: [PATCH 02/11] brcmfmac: add CONFIG_BRCMFMAC_HWSIM_SDIO Kconfig and
+ Makefile entry
+
+Add Kconfig option for SDIO hwsim bus simulation:
+- Selects BRCMFMAC_PROTO_BCDC (uses BCDC protocol like real SDIO)
+- Does NOT select FW_LOADER (no firmware files needed)
+- Add sim_sdio.o to Makefile when HWSIM_SDIO is enabled
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../broadcom/brcm80211/brcmfmac/Kconfig        | 18 ++++++++++++++++++
+ .../broadcom/brcm80211/brcmfmac/Makefile       |  2 ++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Kconfig b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Kconfig
+index 32794c1ec..2debe1b69 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Kconfig
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Kconfig
+@@ -48,3 +48,21 @@ config BRCMFMAC_PCIE
+ 	  IEEE802.11ac embedded FullMAC WLAN driver. Say Y if you want to
+ 	  use the driver for an PCIE wireless card.
+ 
++config BRCMFMAC_HWSIM_SDIO
++	bool "SDIO hwsim bus simulation for FullMAC driver"
++	depends on BRCMFMAC
++	depends on !BRCMFMAC_SDIO
++	select BRCMFMAC_PROTO_BCDC
++	help
++	  This option replaces the real SDIO bus layer with a simulated bus
++	  shim that connects to the brcmfmac_hwsim kernel module. It emulates
++	  a Broadcom FullMAC SDIO device using the BCDC protocol, allowing
++	  the driver to probe and create wlan0 without real hardware.
++
++	  The separate brcmfmac_hwsim.ko module acts as virtual firmware,
++	  handling BCDC ioctls, generating events, and looping back data
++	  packets.
++
++	  This is mutually exclusive with CONFIG_BRCMFMAC_SDIO (real SDIO).
++	  Say Y only for hwsim testing environments.
++
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
+index e5ca0f511..8e90292a2 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/Makefile
+@@ -40,6 +40,8 @@ brcmfmac-$(CONFIG_BRCMFMAC_USB) += \
+ 		usb.o
+ brcmfmac-$(CONFIG_BRCMFMAC_PCIE) += \
+ 		pcie.o
++brcmfmac-$(CONFIG_BRCMFMAC_HWSIM_SDIO) += \
++		sim_sdio.o
+ brcmfmac-$(CONFIG_BRCMDBG) += \
+ 		debug.o
+ brcmfmac-$(CONFIG_BRCM_TRACING) += \
+-- 
+2.50.1 (Apple Git-155)
+

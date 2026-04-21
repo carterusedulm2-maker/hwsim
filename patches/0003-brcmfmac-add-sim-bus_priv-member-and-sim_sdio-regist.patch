@@ -1,0 +1,54 @@
+From 795e6a39adf5e2fb6910c30f6f5fcb3ca968fffc Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 06:53:23 +0800
+Subject: [PATCH 03/11] brcmfmac: add sim bus_priv member and sim_sdio
+ register/exit declarations
+
+- Add struct brcmf_sim_sdio forward declaration
+- Add 'sim' pointer to bus_priv union for hwsim shim private data
+- Add brcmf_sim_sdio_register/exit declarations gated by
+  CONFIG_BRCMFMAC_HWSIM_SDIO, with static inline stubs when disabled
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../net/wireless/broadcom/brcm80211/brcmfmac/bus.h   | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
+index fe31051a9..ed6b7cda5 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/bus.h
+@@ -143,6 +143,9 @@ struct brcmf_bus_stats {
+ 	atomic_t pktcow_failed;
+ };
+ 
++/* Forward declaration for hwsim bus shim private data */
++struct brcmf_sim_sdio;
++
+ /**
+  * struct brcmf_bus - interface structure between common and bus layer
+  *
+@@ -167,6 +170,7 @@ struct brcmf_bus {
+ 		struct brcmf_sdio_dev *sdio;
+ 		struct brcmf_usbdev *usb;
+ 		struct brcmf_pciedev *pcie;
++		struct brcmf_sim_sdio *sim;
+ 	} bus_priv;
+ 	enum brcmf_bus_protocol_type proto_type;
+ 	struct device *dev;
+@@ -339,4 +343,12 @@ static inline void brcmf_pcie_exit(void) { }
+ static inline int brcmf_pcie_register(void) { return 0; }
+ #endif
+ 
++#ifdef CONFIG_BRCMFMAC_HWSIM_SDIO
++void brcmf_sim_sdio_exit(void);
++int brcmf_sim_sdio_register(void);
++#else
++static inline void brcmf_sim_sdio_exit(void) { }
++static inline int brcmf_sim_sdio_register(void) { return 0; }
++#endif
++
+ #endif /* BRCMFMAC_BUS_H */
+-- 
+2.50.1 (Apple Git-155)
+

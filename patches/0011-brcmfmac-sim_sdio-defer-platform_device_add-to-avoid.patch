@@ -1,0 +1,113 @@
+From c2a710963eb7a0aea45e7674b5ea99464810c265 Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Tue, 21 Apr 2026 22:10:17 +0800
+Subject: [PATCH 11/11] brcmfmac: sim_sdio: defer platform_device_add to avoid
+ kmod deadlock
+
+Registering the platform_device in-line from brcmf_core_init() causes
+sim_sdio_probe() to run while module_mutex is still held by the parent
+modprobe.  The probe path calls brcmf_fwvid_attach(), which
+__request_module()s the vendor plugin (brcmfmac-wcc/bca/cyw); the child
+modprobe then blocks on module_mutex, deadlocking the kernel thread.
+
+Defer platform_device_add() to a workqueue scheduled after
+platform_driver_register(), so the probe only runs once
+brcmfmac_module_init() has returned and the mutex is released.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../broadcom/brcm80211/brcmfmac/sim_sdio.c    | 50 ++++++++++++++-----
+ 1 file changed, 38 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sim_sdio.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sim_sdio.c
+index fc241fe63..d5a1c92d9 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sim_sdio.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/sim_sdio.c
+@@ -407,12 +407,37 @@ static struct platform_driver sim_sdio_driver = {
+ 
+ /* We hold onto the platform device so we can unregister it in exit */
+ static struct platform_device *sim_pdev;
++static struct work_struct sim_pdev_add_work;
++static bool sim_driver_registered;
++
++/*
++ * Defer platform_device_add() to a work item so that sim_sdio_probe()
++ * does not execute while brcmfmac's module_init() still holds
++ * module_mutex.  The probe path calls __request_module() for the
++ * vendor plugin (brcmfmac-wcc / bca / cyw), which must wait for
++ * module_mutex; running it in-line from module_init deadlocks.
++ */
++static void sim_pdev_add_worker(struct work_struct *work)
++{
++	int ret;
++
++	if (!sim_pdev)
++		return;
++
++	ret = platform_device_add(sim_pdev);
++	if (ret) {
++		brcmf_err("sim_sdio: platform_device_add failed: %d\n", ret);
++		platform_device_put(sim_pdev);
++		sim_pdev = NULL;
++	}
++}
+ 
+ /**
+  * brcmf_sim_sdio_register - called from brcmf_core_init()
+  *
+- * Creates a platform_device and registers the platform driver.
+- * The driver's probe function handles all the real initialization.
++ * Allocates a platform_device, registers the platform driver, and
++ * schedules platform_device_add() to run asynchronously once
++ * module_init has released module_mutex.
+  */
+ int brcmf_sim_sdio_register(void)
+ {
+@@ -420,25 +445,20 @@ int brcmf_sim_sdio_register(void)
+ 
+ 	brcmf_dbg(SIM, "registering simulated SDIO bus\n");
+ 
+-	/* Create the platform device first */
+ 	sim_pdev = platform_device_alloc(SIM_PLATFORM_NAME, PLATFORM_DEVID_NONE);
+ 	if (!sim_pdev)
+ 		return -ENOMEM;
+ 
+-	ret = platform_device_add(sim_pdev);
++	ret = platform_driver_register(&sim_sdio_driver);
+ 	if (ret) {
+ 		platform_device_put(sim_pdev);
+ 		sim_pdev = NULL;
+ 		return ret;
+ 	}
++	sim_driver_registered = true;
+ 
+-	/* Register the driver — triggers probe if device is already added */
+-	ret = platform_driver_register(&sim_sdio_driver);
+-	if (ret) {
+-		platform_device_unregister(sim_pdev);
+-		sim_pdev = NULL;
+-		return ret;
+-	}
++	INIT_WORK(&sim_pdev_add_work, sim_pdev_add_worker);
++	schedule_work(&sim_pdev_add_work);
+ 
+ 	return 0;
+ }
+@@ -450,7 +470,13 @@ void brcmf_sim_sdio_exit(void)
+ {
+ 	brcmf_dbg(SIM, "unregistering simulated SDIO bus\n");
+ 
+-	platform_driver_unregister(&sim_sdio_driver);
++	/* Ensure the deferred add has finished before we tear down */
++	flush_work(&sim_pdev_add_work);
++
++	if (sim_driver_registered) {
++		platform_driver_unregister(&sim_sdio_driver);
++		sim_driver_registered = false;
++	}
+ 
+ 	if (sim_pdev) {
+ 		platform_device_unregister(sim_pdev);
+-- 
+2.50.1 (Apple Git-155)
+
