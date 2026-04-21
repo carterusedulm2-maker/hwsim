@@ -1,0 +1,55 @@
+From 062bcd7c36c33e7ae0f15af4cbd8900ee56b7c91 Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Tue, 21 Apr 2026 22:20:38 +0800
+Subject: [PATCH 13/13] brcmfmac/hwsim: suppress HT 40MHz to silence bw40
+ chanspec WARN
+
+Return BCME_UNSUPPORTED for 'bw_cap' GET and 'mimo_bw_cap'/'bw_cap' SET
+so brcmf_enable_bw40_2g() bails out, causing cfg80211 to mask off
+IEEE80211_HT_CAP_SUP_WIDTH_20_40.  This avoids the decchspec WARN_ON
+that fires when the bw40 chanspecs re-query returns BW_20 entries.
+
+dmesg is now clean after brcmfmac probe: zero WARNING/error lines.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c        | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index 0704d8f34..e140700ae 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -552,8 +552,11 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 	}
+ 
+ 	if (strcmp(iovar, "bw_cap") == 0) {
+-		__le32 val = cpu_to_le32(0x1); /* 20MHz */
+-		hwsim_build_ok(dev, req, &val, sizeof(val));
++		/* Report bw_cap query as unsupported so cfg80211 disables
++		 * 40MHz HT cap and skips the bw40 chanspecs path, avoiding
++		 * WARN_ON in brcmf_enable_bw40_2g().
++		 */
++		hwsim_build_error(dev, req, BCME_UNSUPPORTED);
+ 		return 0;
+ 	}
+ 
+@@ -631,6 +634,15 @@ static int hwsim_handle_set_var(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
++	/* Reject these so brcmf_enable_bw40_2g() bails early and
++	 * cfg80211 masks off HT 40MHz, avoiding a harmless WARN.
++	 */
++	if (strcmp(iovar, "mimo_bw_cap") == 0 ||
++	    strcmp(iovar, "bw_cap") == 0) {
++		hwsim_build_error(dev, req, BCME_UNSUPPORTED);
++		return 0;
++	}
++
+ 	/* --- Runtime --- */
+ 
+ 	if (strcmp(iovar, "country") == 0) {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -552,8 +552,11 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 	}
 
 	if (strcmp(iovar, "bw_cap") == 0) {
-		__le32 val = cpu_to_le32(0x1); /* 20MHz */
-		hwsim_build_ok(dev, req, &val, sizeof(val));
+		/* Report bw_cap query as unsupported so cfg80211 disables
+		 * 40MHz HT cap and skips the bw40 chanspecs path, avoiding
+		 * WARN_ON in brcmf_enable_bw40_2g().
+		 */
+		hwsim_build_error(dev, req, BCME_UNSUPPORTED);
 		return 0;
 	}
 
@@ -628,6 +631,15 @@ static int hwsim_handle_set_var(struct hwsim_dev *dev,
 	if (strcmp(iovar, "join_pref") == 0 ||
 	    strcmp(iovar, "txbf") == 0) {
 		hwsim_build_ok(dev, req, NULL, 0);
+		return 0;
+	}
+
+	/* Reject these so brcmf_enable_bw40_2g() bails early and
+	 * cfg80211 masks off HT 40MHz, avoiding a harmless WARN.
+	 */
+	if (strcmp(iovar, "mimo_bw_cap") == 0 ||
+	    strcmp(iovar, "bw_cap") == 0) {
+		hwsim_build_error(dev, req, BCME_UNSUPPORTED);
 		return 0;
 	}
 

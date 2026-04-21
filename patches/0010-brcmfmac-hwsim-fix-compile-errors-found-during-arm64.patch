@@ -1,7 +1,7 @@
 From 3b4728d6848436a87125bb0c27f75f9cfd7807ce Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Tue, 21 Apr 2026 21:44:36 +0800
-Subject: [PATCH 10/12] brcmfmac/hwsim: fix compile errors found during arm64
+Subject: [PATCH 10/13] brcmfmac/hwsim: fix compile errors found during arm64
  VM validation
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
