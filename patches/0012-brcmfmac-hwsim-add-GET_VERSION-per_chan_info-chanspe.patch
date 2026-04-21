@@ -1,0 +1,73 @@
+From a80d0c6bb4d95e4b89f30d17087b5ea9f834b50a Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Tue, 21 Apr 2026 22:17:59 +0800
+Subject: [PATCH 12/12] brcmfmac/hwsim: add GET_VERSION, per_chan_info,
+ chanspecs handlers
+
+Completes Milestone 1: wlan0 successfully registers with cfg80211.
+
+- BRCMF_C_GET_VERSION dcmd returns D11AC_IOTYPE (2)
+- 'per_chan_info' bsscfg iovar returns 0 (no radar, active)
+- 'chanspecs' iovar returns a 3-entry list (ch 1/6/11, 20 MHz, 2.4 GHz)
+  encoded in D11AC format
+
+Verified under QEMU/HVF + Linux 6.12.81-hwsim:
+  wlan0  DOWN  02:00:00:48:53:00  <BROADCAST,MULTICAST>
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 31 +++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index 483855d4e..0704d8f34 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -527,6 +527,30 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
++	if (strcmp(iovar, "per_chan_info") == 0) {
++		/* No radar, not passive-only: return 0 flags */
++		__le32 val = cpu_to_le32(0);
++		hwsim_build_ok(dev, req, &val, sizeof(val));
++		return 0;
++	}
++
++	if (strcmp(iovar, "chanspecs") == 0) {
++		/* D11AC encoding: ch_num | BW_20 (0x1000) | BND_2G (0x0000) */
++		struct {
++			__le32 count;
++			__le32 element[3];
++		} list = {
++			.count = cpu_to_le32(3),
++			.element = {
++				cpu_to_le32(0x1001), /* ch 1,  20 MHz, 2.4G */
++				cpu_to_le32(0x1006), /* ch 6,  20 MHz, 2.4G */
++				cpu_to_le32(0x100B), /* ch 11, 20 MHz, 2.4G */
++			},
++		};
++		hwsim_build_ok(dev, req, &list, sizeof(list));
++		return 0;
++	}
++
+ 	if (strcmp(iovar, "bw_cap") == 0) {
+ 		__le32 val = cpu_to_le32(0x1); /* 20MHz */
+ 		hwsim_build_ok(dev, req, &val, sizeof(val));
+@@ -678,6 +702,13 @@ static int hwsim_handle_cmd(struct hwsim_dev *dev,
+ 	case BRCMF_C_SET_VAR:
+ 		return hwsim_handle_set_var(dev, req, payload, payload_len);
+ 
++	case BRCMF_C_GET_VERSION: {
++		/* Returns the D11 IO type; cfg80211_attach() requires it. */
++		__le32 val = cpu_to_le32(2); /* BRCMU_D11AC_IOTYPE */
++		hwsim_build_ok(dev, req, &val, sizeof(val));
++		return 0;
++	}
++
+ 	case BRCMF_C_GET_REVINFO: {
+ 		struct brcmf_rev_info_le ri = {};
+ 
+-- 
+2.50.1 (Apple Git-155)
+

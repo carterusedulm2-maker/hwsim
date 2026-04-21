@@ -527,6 +527,30 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 		return 0;
 	}
 
+	if (strcmp(iovar, "per_chan_info") == 0) {
+		/* No radar, not passive-only: return 0 flags */
+		__le32 val = cpu_to_le32(0);
+		hwsim_build_ok(dev, req, &val, sizeof(val));
+		return 0;
+	}
+
+	if (strcmp(iovar, "chanspecs") == 0) {
+		/* D11AC encoding: ch_num | BW_20 (0x1000) | BND_2G (0x0000) */
+		struct {
+			__le32 count;
+			__le32 element[3];
+		} list = {
+			.count = cpu_to_le32(3),
+			.element = {
+				cpu_to_le32(0x1001), /* ch 1,  20 MHz, 2.4G */
+				cpu_to_le32(0x1006), /* ch 6,  20 MHz, 2.4G */
+				cpu_to_le32(0x100B), /* ch 11, 20 MHz, 2.4G */
+			},
+		};
+		hwsim_build_ok(dev, req, &list, sizeof(list));
+		return 0;
+	}
+
 	if (strcmp(iovar, "bw_cap") == 0) {
 		__le32 val = cpu_to_le32(0x1); /* 20MHz */
 		hwsim_build_ok(dev, req, &val, sizeof(val));
@@ -677,6 +701,13 @@ static int hwsim_handle_cmd(struct hwsim_dev *dev,
 
 	case BRCMF_C_SET_VAR:
 		return hwsim_handle_set_var(dev, req, payload, payload_len);
+
+	case BRCMF_C_GET_VERSION: {
+		/* Returns the D11 IO type; cfg80211_attach() requires it. */
+		__le32 val = cpu_to_le32(2); /* BRCMU_D11AC_IOTYPE */
+		hwsim_build_ok(dev, req, &val, sizeof(val));
+		return 0;
+	}
 
 	case BRCMF_C_GET_REVINFO: {
 		struct brcmf_rev_info_le ri = {};
