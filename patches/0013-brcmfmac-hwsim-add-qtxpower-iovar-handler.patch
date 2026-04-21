@@ -1,0 +1,37 @@
+From f7b675d904c8c10b01633b6e1d24a2144edc463b Mon Sep 17 00:00:00 2001
+From: hwsim dev <dev@hwsim>
+Date: Tue, 21 Apr 2026 22:23:09 +0800
+Subject: [PATCH 13/13] brcmfmac: hwsim: add qtxpower iovar handler
+
+wpa_supplicant and cfg80211 .get_tx_power query this iovar.
+Returning a fixed 20 dBm (qdbm=80) eliminates the last
+'brcmf_cfg80211_get_tx_power: error (-52)' in dmesg, making
+the runtime log 100% clean under both 'ip link set up' and
+a full wpa_supplicant attach/detach cycle.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c         | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index e140700ae..413a8da96 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -566,6 +566,13 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
++	if (strcmp(iovar, "qtxpower") == 0) {
++		/* Report 20 dBm (qdbm = dBm * 4) */
++		__le32 val = cpu_to_le32(80);
++		hwsim_build_ok(dev, req, &val, sizeof(val));
++		return 0;
++	}
++
+ 	if (strcmp(iovar, "nmode") == 0 || strcmp(iovar, "vhtmode") == 0) {
+ 		__le32 val = cpu_to_le32(1);
+ 		hwsim_build_ok(dev, req, &val, sizeof(val));
+-- 
+2.50.1 (Apple Git-155)
+
