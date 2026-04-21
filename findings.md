@@ -466,3 +466,49 @@ The probe flow is mostly correct but the three CRITICAL items (DR-01 wrong funct
 ### Process note — STALE MODULE BUG (engineer-caused)
 - The test script lost its copy-from-orb-to-/tmp step during refactoring. Result: 3 test cycles loaded an outdated .ko, consuming ~20 min on phantom "handler not reached" debugging.
 - Mitigation added: always assert `grep -ac <new_string> vm/brcmfmac_hwsim.ko` before scp'ing to VM.
+
+## M2-B Design — hostapd open-system AP on wlan1 (planned 2026-04-21)
+
+### Source-confirmed startup sequence (from sub-agent trace of cfg80211.c:5095 brcmf_cfg80211_start_ap)
+Pre-startup probes (run at brcmf_feat_attach + brcmf_config_dongle, ifidx=0):
+- iovar GET cap, pfn, wowl, rsdb_mode, tdls_enable, mfp, dump_obss, sup_wpa, scan_ver, wlc_ver
+- WLC C_UP, C_SET_PM, C_SET_ROAM_TRIGGER, C_SET_ROAM_DELTA, C_SET_FAKEFRAG=1
+- iovar SET arp_ol/arpoe/ndoe (ifidx=0)
+All already handled or BCME_UNSUPPORTED-tolerated by current hwsim_core.
+
+start_ap exact order (ifidx=1, bsscfgidx=1, no RSDB/MCHAN, open-system):
+1. WLC C_GET_REGULATORY (46) -> u32 11d mode (non-fatal if BCME_UNSUPPORTED)
+2. iovar SET mpc=0 (per-AP-ifp), tolerated
+3. iovar SET arp_ol=0, arpoe=0, ndoe=0 (per-AP-ifp), tolerated
+4. WLC C_SET_REGULATORY (47) only if is_11d differs (skip)
+5. WLC C_SET_BCNPRD (76) = beacon_interval (u32) -- FATAL
+6. WLC C_SET_DTIMPRD (78) = dtim_period (u32) -- FATAL
+7. WLC C_DOWN (3) = 1 -- FATAL (fires for ifidx=1 + no RSDB/MCHAN)
+8. iovar SET apsta=0 -- error ignored
+9. WLC C_SET_INFRA (20) = 1 -- FATAL
+10. iovar SET mbss=1 -- only if BRCMF_FEAT_MBSS (we don't advertise -> skipped)
+11. WLC C_SET_AP (118) = 1 -- FATAL
+12. iovar SET chanspec=u16 LE -- FATAL (skipped if mbss; we're not mbss so it fires)
+13. WLC C_UP (2) = 1 -- FATAL
+14. (open-system, no PSK/SAE) bsscfg SET auth=0, wsec=0, wpa_auth=0 (bsscfgidx=1) -- FATAL
+15. WLC C_SET_SSID (26) = struct brcmf_join_params {ssid_len(LE32), ssid[32], params_le{0...}} -- FATAL (this is the AP-start trigger!)
+16. bsscfg SET closednet=0|1 (bsscfgidx=1) -- FATAL
+17. bsscfg SET vndr_ie x3 (BEACON_FLAG, PRBRSP_FLAG, ASSOCRSP_FLAG) -- non-fatal
+
+start_ap is fully synchronous. NO fweh event needed for AP-ENABLED state.
+For STA association later (M2-D): firmware must inject BRCMF_E_ASSOC_IND (event_type=8, status=0, flags=BRCMF_EVENT_MSG_LINK, addr=STA_MAC, bsscfgidx=1, datalen=assoc_req_ies_len).
+
+### BCDC bsscfg iovar wire format (CRITICAL)
+`brcmf_fil_bsscfg_*` for bsscfgidx>=1 encodes payload as:
+  "bsscfg:\0" + name + "\0" + LE32(bsscfgidx) + data
+Our current hwsim_handle_get_var/set_var must detect the "bsscfg:" prefix, extract bsscfgidx, then fall through to plain iovar dispatch keyed by name. NEEDS VERIFICATION before implementing M2-B handlers.
+
+### chanspec encoding (brcmu_d11ac_encchspec / brcmu_d11n_encchspec)
+2.4GHz, ch=1, 20MHz -> 0x1001
+2.4GHz, ch=6, 20MHz -> 0x1006
+5GHz, ch=36, 20MHz -> 0xd024
+Format (low byte = chan number, high byte = bw|band|sb).
+
+### Per-bsscfg state addition
+struct hwsim_bss { bool up; u32 auth, wsec, wpa_auth, closednet; u32 bcn_period, dtim_period; u16 chanspec; u8 ssid[32], ssid_len; };
+struct hwsim_bss bss[2]; /* idx 0 = primary STA, idx 1 = AP */

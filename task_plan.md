@@ -1157,3 +1157,32 @@ brcmf_c_preinit_dcmds(ifp) calls:
 - The bus shim + mocked bus module interface should be clean enough that the same mocked bus module works with both SDIO and PCIe shims — the module handles protocol framing differences internally.
 - Firmware download in Option A: the bus shim skips firmware loading entirely. For future Option B, keep the firmware loading path but make the mocked bus module accept any content.
 - The mocked bus module must be loaded BEFORE brcmfmac for the bus shim to find it during probe. Module dependency should enforce this.
+
+## Phase M2-B — hostapd open-system AP on wlan1 (planned)
+
+### Status: planned (design locked)
+
+### Implementation checklist (atomic items)
+- [ ] B0: verify bsscfg: prefix is parsed by hwsim_handle_set_var/get_var; if not, add prefix decoder that strips prefix + extracts LE32 bsscfgidx, passes the rest to existing dispatcher with bsscfgidx context.
+- [ ] B1: add `struct hwsim_bss bss[2]` to hwsim_dev; init in init_dev.
+- [ ] B2: WLC dcmd handlers: C_GET_REGULATORY, C_SET_BCNPRD, C_SET_DTIMPRD, C_DOWN, C_SET_INFRA, C_SET_AP, C_UP, C_SET_SSID.
+- [ ] B3: iovar SET handlers (global): mpc, apsta.
+- [ ] B4: iovar SET handlers (per-iface ifidx=1): arp_ol, arpoe, ndoe.
+- [ ] B5: bsscfg SET handlers (bsscfgidx=1): auth, wsec, wpa_auth, closednet, vndr_ie.
+- [ ] B6: chanspec iovar SET handler (decode bw/band/chan; for M2-B store raw value, no validation).
+- [ ] B7: build clean, deploy to VM with stale-module-check.
+- [ ] B8: write /tmp/hostapd-wlan1.conf (interface=wlan1, driver=nl80211, ssid="brcmsim", channel=6, hw_mode=g, no encryption).
+- [ ] B9: run `hostapd -B /tmp/hostapd-wlan1.conf`, verify rc=0 + `hostapd_cli status` shows `state=ENABLED`.
+- [ ] B10: dmesg audit (0 error/warn besides clm_blob).
+- [ ] B11: 3x stop/start hostapd cycle stable.
+- [ ] B12: commit + sync overlay/patches + push.
+
+### Exit criteria
+- `hostapd_cli -i wlan1 status` reports `state=ENABLED`
+- `iw dev wlan1 info` shows type AP, ssid, channel
+- 3 cycles stable
+
+### Open questions / risks
+- Does our dispatcher already strip "bsscfg:" prefix? (B0 must answer first.)
+- C_SET_SSID payload is `struct brcmf_join_params` — first 4 bytes are SSID len LE32, then 32-byte SSID, then a chunk of zero `params_le` (~64 bytes). We just need to record ssid_len + ssid; rest can be ignored.
+- vndr_ie may be sent BEFORE start_ap finishes (during change_beacon callbacks) — return ACK regardless.
