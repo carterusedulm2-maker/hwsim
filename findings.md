@@ -444,3 +444,25 @@ The probe flow is mostly correct but the three CRITICAL items (DR-01 wrong funct
 
 *Update this file after every 2 view/browser/search operations*
 *This prevents visual information from being lost*
+
+## M2-A Attempt 1 Findings (2026-04-21, session pause)
+
+### Known good
+- interface_create v1 struct layout verified: ver@0, flags@4, mac@8, wlc_index@16, size=20 (natural alignment, NOT __packed).
+- Handler reached only after fixing the orb->/tmp copy step (modules were stale for 3 iterations — silent failure because file sizes differed).
+- hwsim_handle_get_var successfully sees the iovar name; BCDC status translation: BCME_* -> -EBADE (fwil.c:121), so "err=-52" in dmesg = -EBADE = firmware-level error, NOT our handler missing.
+
+### Blocker
+- After returning OK from interface_create GET + queuing delayed IF_ADD event, VM serial went silent and SSH became unreachable. No oops visible in console.log — likely soft lockup inside brcmf fweh -> brcmf_add_if -> register_netdev -> rtnl_lock contention. QEMU process still alive.
+- Hypothesis: our IF_ADD event is dispatched on the ctl workqueue while the driver may already hold a lock that register_netdev needs; OR we sent a second skb to rx_data before the driver finished consuming the dcmd response to interface_create.
+
+### Next-session action plan
+1. Hard-reboot the VM (stop qemu process by PID from vm/qemu.pid, restart).
+2. Before re-enabling IF_ADD event, audit locking: check if the event delivery context is compatible with rtnl_lock requirements of register_netdev.
+3. Emit event from a FRESH workqueue tied to neither tx_ctl nor scan paths.
+4. Lengthen the msleep delay (50-100ms) to ensure the dcmd response completes before event arrives.
+5. Keep pr_info in place — debug prints proved essential to catching the stale-module issue.
+
+### Process note — STALE MODULE BUG (engineer-caused)
+- The test script lost its copy-from-orb-to-/tmp step during refactoring. Result: 3 test cycles loaded an outdated .ko, consuming ~20 min on phantom "handler not reached" debugging.
+- Mitigation added: always assert `grep -ac <new_string> vm/brcmfmac_hwsim.ko` before scp'ing to VM.

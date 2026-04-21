@@ -8,7 +8,36 @@ Design and implement a two-component simulation stack for `brcmfmac` in Linux 6.
 The end result: brcmfmac probes a simulated phy device, creates `wlan0`, and communicates through the mock bus module as if talking to real Broadcom firmware.
 
 ## Current Phase
-Phase 11 — Amended Architecture Design (v5.3 — All Reviews 完成)
+**Milestone 1 — ✅ COMPLETE (2026-04-21)**: wlan0 probes via sim_sdio, wpa_supplicant can attach/detach, dmesg 100% clean (0 WARNING / 0 error).
+**Milestone 2 — 🚧 IN PROGRESS**: wlan1 AP + hostapd + wlan0 STA associate + data-plane loopback.
+
+## Milestone 2 Scope (User approved 2026-04-21 — "option 3")
+Goal: Bring up hostapd on a second virtual interface `wlan1` (AP mode) on the same phy, have `wpa_supplicant` on `wlan0` scan, find, authenticate, associate, and exchange data frames with the AP — all over the sim_sdio mock bus. No real RF / no real firmware.
+
+### M2 Phase Map
+| Phase | Deliverable | Key Work |
+|-------|------------|----------|
+| M2-A  | wlan1 AP iface appears after `iw dev wlan0 interface add wlan1 type __ap` | `interface_create` iovar v1 GET handler that echoes struct back with synthesized MAC; emit `WLC_E_IF` ADD event → driver calls `brcmf_add_if` → register_netdev wlan1 |
+| M2-B  | `hostapd` binary loads, reaches `WLAN_STATUS_SUCCESS` on wlan1 | AP iovars: `bsscfg:ssid`, `bsscfg:ap`, `bss`, `bcn_prb`, `wsec`, `wpa_auth`, `mpc`, dcmds `WLC_SET_SSID`, `WLC_SET_BEACON_INTERVAL`, `WLC_DOWN/UP`, `WLC_SET_AP`, `WLC_SET_CHANNEL` + event `WLC_E_LINK` on AP |
+| M2-C  | `wpa_supplicant` on wlan0 sees the AP SSID in scan results | escan path: `escan`/`escan_params` iovar sink → sim fabricates BSS announcement matching wlan1's config, sends `WLC_E_ESCAN_RESULT` events with synthesized beacon IE buffer |
+| M2-D  | wlan0 associates with wlan1 AP (4-way handshake works) | JOIN/AUTH/ASSOC dcmds + events `WLC_E_AUTH`, `WLC_E_ASSOC`, `WLC_E_LINK`; inter-bsscfg EAPOL data forwarding inside sim_sdio |
+| M2-E  | `ping` from wlan0 to wlan1 side reaches userspace | Data-plane loopback in sim_sdio: wlan0 TX SKB → route by dst MAC → wlan1 RX via `brcmf_rx_frame`; both sides see each other's traffic |
+
+### M2 Exit Criteria
+- `hostapd -i wlan1 -dd` stays running with `AP-ENABLED`
+- `wpa_cli -i wlan0 scan_results` lists the SSID
+- `wpa_cli -i wlan0 status` shows `wpa_state=COMPLETED`
+- `ping -I wlan0 <wlan1-side-addr>` succeeds
+- dmesg during the whole flow: 0 WARNING / 0 stack trace (errors only for designed-refusal cases)
+- handover protocol: every phase transition writes a checkpoint block to progress.md and updates this plan
+
+### M2 Handover Protocol (enforced)
+1. **At every phase boundary** (A→B, B→C, …) append to progress.md:
+   - Current goal, current phase, files modified, commands run, validation done, next exact action, blockers.
+2. **After every 2 search/view/edit operations** persist key findings into findings.md.
+3. **Every commit** updates the overlay repo (`/Users/carterchan/working/coding/hwsim/repo/`) and pushes to GitHub.
+4. **3-strike rule**: any single iovar/dcmd/event that fails 3 times in a row → stop, escalate via `ask_user`, do not retry the same code path.
+5. **Stop gate**: do not close out a session while planning files are stale relative to code. Final action per session = write handover block.
 
 ## Reviews Completed
 - ✅ CEO Review: 3 blockers resolved

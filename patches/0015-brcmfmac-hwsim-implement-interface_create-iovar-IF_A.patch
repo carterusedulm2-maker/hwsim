@@ -1,0 +1,239 @@
+From f48ee6a21e7f641fd312e1a6abf60349859d546e Mon Sep 17 00:00:00 2001
+From: Carter Chan <carter@local>
+Date: Wed, 22 Apr 2026 07:49:16 +0800
+Subject: [PATCH 15/15] brcmfmac: hwsim: implement interface_create iovar +
+ IF_ADD event (M2-A)
+
+Add support for `iw dev wlan0 interface add wlan1 type __ap` so a second
+(AP) virtual interface can be created on top of the mock bus.
+
+Two pieces:
+  * interface_create v1 iovar GET handler -- parses the 20-byte
+    wl_interface_create_v1 request (natural alignment, NOT __packed:
+    ver@0, flags@4, mac@8, wlc_index@16), allocates a deterministic AP
+    MAC if MAC_USE flag is unset (LAA bit + low-byte XOR), records the
+    AP iface state, and echoes the layout back with wlc_index=1.
+  * hwsim_if_add_work_fn delayed-work emitter -- 10 ms after the dcmd
+    response is delivered, sends a BRCMF_E_IF event with action=IF_ADD,
+    role=AP, ifname="wlan1". The event walks fweh -> brcmf_notify_vif_event
+    which wakes the cfg80211 caller; cfg80211 then calls brcmf_net_attach
+    in its own context (rtnl already held) -> register_netdevice creates
+    wlan1.
+
+Lock-chain note: hwsim_tx_ctl already serialises on dev->lock, so the
+iovar handler must NOT re-acquire it (non-recursive mutex => self-
+deadlock; we hit this and the cfg80211 caller, holding rtnl, hung the
+whole VM until the watchdog timeout). The interface_create handler now
+runs lock-free relative to dev->lock, relying on the caller's lock.
+
+Validated:
+  * iw dev wlan0 interface add wlan1 type __ap -> rc=0
+  * wlan1 appears with derived MAC, ip link set wlan1 up clean
+  * 3x rmmod/insmod/add cycle stable, no leaks/warnings
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 153 ++++++++++++++++++
+ 1 file changed, 153 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index 413a8da96..c0f8a576e 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -128,8 +128,15 @@ struct hwsim_dev {
+ 	struct mutex lock;
+ 	struct delayed_work scan_work;
+ 	struct delayed_work connect_work;
++	struct delayed_work if_add_work;
+ 	struct workqueue_struct *wq;
+ 
++	/* M2-A: virtual AP interface state */
++	bool ap_iface_created;
++	u8 ap_iface_mac[ETH_ALEN];
++	u8 ap_iface_ifidx;
++	u8 ap_iface_bsscfgidx;
++
+ 	/* Fault injection state (Phase 17) */
+ 	struct {
+ 		u32 force_ioctl_error;   /* non-zero → all ioctls return this BCME code */
+@@ -434,6 +441,73 @@ static void hwsim_connect_work_fn(struct work_struct *work)
+ 		hwsim_send_event(dev, skb);
+ }
+ 
++/* ======================================================================
++ * IF-ADD event generator (workqueue) — Milestone 2 Phase A
++ *
++ * After a successful `interface_create` iovar GET, we must deliver a
++ * WLC_E_IF event with action=BRCMF_E_IF_ADD so fweh.c calls
++ * brcmf_add_if() → register_netdev("wlan1"). This runs async because
++ * the response to the creating dcmd has to be sent first (the driver
++ * then waits for the event inside brcmf_cfg80211_wait_vif_event).
++ * ====================================================================== */
++
++static void hwsim_if_add_work_fn(struct work_struct *work)
++{
++	struct hwsim_dev *dev = container_of(work, struct hwsim_dev,
++					     if_add_work.work);
++	struct sk_buff *skb;
++	struct brcmf_if_event ifevent;
++	u8 ifidx, bsscfgidx;
++	u8 mac[ETH_ALEN];
++
++	mutex_lock(&dev->lock);
++	if (dev->detached || !dev->ap_iface_created) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++	ifidx = dev->ap_iface_ifidx;
++	bsscfgidx = dev->ap_iface_bsscfgidx;
++	memcpy(mac, dev->ap_iface_mac, ETH_ALEN);
++	dev->fi.event_count++;
++	mutex_unlock(&dev->lock);
++
++	memset(&ifevent, 0, sizeof(ifevent));
++	ifevent.ifidx = ifidx;
++	ifevent.action = BRCMF_E_IF_ADD;
++	ifevent.flags = 0;
++	ifevent.bsscfgidx = bsscfgidx;
++	ifevent.role = BRCMF_E_IF_ROLE_AP;
++
++	/* NOTE: hwsim_alloc_event_skb uses `ifidx` param only to fill the
++	 * BCDC header flag2 (which routes the event skb to a primary iface
++	 * for delivery to fweh). Event target iface is carried in the
++	 * emsg->ifname / emsg->addr / ifevent.bsscfgidx which fweh uses to
++	 * allocate the new brcmf_if slot. We therefore pass 0 for the BCDC
++	 * ifidx so the event is dispatched via the primary iface.
++	 */
++	skb = hwsim_alloc_event_skb(dev, BRCMF_E_IF,
++				    BRCMF_E_STATUS_SUCCESS, 0, 0,
++				    mac, 0, &ifevent, sizeof(ifevent));
++	if (!skb)
++		return;
++
++	/* Override the auto-generated ifname with the requested interface
++	 * name. hwsim_alloc_event_skb stamps "wlan<ifidx>" based on the
++	 * BCDC ifidx parameter; for IF_ADD we want the AP name.
++	 */
++	{
++		struct brcmf_event *ev;
++
++		ev = (struct brcmf_event *)(skb->data + HWSIM_BCDC_HEADER_LEN);
++		memset(ev->msg.ifname, 0, IFNAMSIZ);
++		snprintf(ev->msg.ifname, IFNAMSIZ, "wlan%u", ifidx);
++		ev->msg.ifidx = ifidx;
++		ev->msg.bsscfgidx = bsscfgidx;
++	}
++
++	hwsim_send_event(dev, skb);
++}
++
+ /* ======================================================================
+  * IOCTL/IOVAR command handlers
+  * ====================================================================== */
+@@ -573,6 +647,82 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
++	if (strcmp(iovar, "interface_create") == 0) {
++		/*
++		 * expects firmware to return the same layout with the allocated
++		 * MAC and wlc_index.
++		 *
++		 * Only v1 is supported here. v2/v3 probes will fall through to
++		 * BCME_UNSUPPORTED below. The driver tries v1 first, so this is
++		 * enough to create a second (AP) bsscfg.
++		 *
++		 * struct wl_interface_create_v1 is not __packed, so:
++		 *   offset 0:  u16 ver
++		 *   offset 4:  u32 flags
++		 *   offset 8:  u8  mac_addr[6]
++		 *   offset 16: u32 wlc_index
++		 *   total size: 20 bytes
++		 */
++		const u8 *iface_buf;
++		uint iface_len;
++		u16 ver;
++		u32 flags;
++		u8 mac[ETH_ALEN];
++
++		iface_buf = payload + name_len;
++		if (payload_len < name_len + 20)
++			goto unsupported;
++		iface_len = payload_len - name_len;
++
++		ver = iface_buf[0] | (iface_buf[1] << 8);
++		flags = iface_buf[4] | (iface_buf[5] << 8) |
++			(iface_buf[6] << 16) | (iface_buf[7] << 24);
++		memcpy(mac, iface_buf + 8, ETH_ALEN);
++
++		/* Only support a single AP bsscfg for M2-A. */
++		if (ver != 1) /* WL_INTERFACE_CREATE_VER_1 */
++			goto unsupported;
++
++		/* Caller (hwsim_tx_ctl) already holds dev->lock; do not
++		 * re-acquire it here or we self-deadlock on the
++		 * non-recursive mutex.
++		 */
++		if (dev->ap_iface_created) {
++			hwsim_build_error(dev, req, BCME_UNSUPPORTED);
++			return 0;
++		}
++		dev->ap_iface_created = true;
++		dev->ap_iface_ifidx = 1;
++		dev->ap_iface_bsscfgidx = 1;
++		if (flags & 0x2 /* WL_INTERFACE_MAC_USE */) {
++			memcpy(dev->ap_iface_mac, mac, ETH_ALEN);
++		} else {
++			memcpy(dev->ap_iface_mac, dev->mac_addr, ETH_ALEN);
++			dev->ap_iface_mac[0] |= 0x02;
++			dev->ap_iface_mac[5] ^= 0x10;
++			memcpy(mac, dev->ap_iface_mac, ETH_ALEN);
++		}
++
++		{
++			u8 out[20];
++
++			memset(out, 0, sizeof(out));
++			out[0] = ver & 0xFF;
++			out[1] = (ver >> 8) & 0xFF;
++			out[4] = flags & 0xFF;
++			out[5] = (flags >> 8) & 0xFF;
++			out[6] = (flags >> 16) & 0xFF;
++			out[7] = (flags >> 24) & 0xFF;
++			memcpy(out + 8, mac, ETH_ALEN);
++			out[16] = 1; /* wlc_index = 1 for the AP bsscfg */
++			hwsim_build_ok(dev, req, out, sizeof(out));
++		}
++
++		queue_delayed_work(dev->wq, &dev->if_add_work,
++				   msecs_to_jiffies(10));
++		return 0;
++	}
++
+ 	if (strcmp(iovar, "nmode") == 0 || strcmp(iovar, "vhtmode") == 0) {
+ 		__le32 val = cpu_to_le32(1);
+ 		hwsim_build_ok(dev, req, &val, sizeof(val));
+@@ -1064,6 +1214,7 @@ static void hwsim_detach(void *ctx)
+ 
+ 	cancel_delayed_work_sync(&dev->scan_work);
+ 	cancel_delayed_work_sync(&dev->connect_work);
++	cancel_delayed_work_sync(&dev->if_add_work);
+ 
+ 	pr_info("brcmfmac_hwsim: detached\n");
+ }
+@@ -1233,6 +1384,7 @@ static struct hwsim_dev *hwsim_dev_alloc(void)
+ 
+ 	INIT_DELAYED_WORK(&dev->scan_work, hwsim_scan_work_fn);
+ 	INIT_DELAYED_WORK(&dev->connect_work, hwsim_connect_work_fn);
++	INIT_DELAYED_WORK(&dev->if_add_work, hwsim_if_add_work_fn);
+ 
+ 	dev->wq = alloc_ordered_workqueue("brcmfmac_hwsim", 0);
+ 	if (!dev->wq) {
+@@ -1250,6 +1402,7 @@ static void hwsim_dev_free(struct hwsim_dev *dev)
+ 
+ 	cancel_delayed_work_sync(&dev->scan_work);
+ 	cancel_delayed_work_sync(&dev->connect_work);
++	cancel_delayed_work_sync(&dev->if_add_work);
+ 	if (dev->wq)
+ 		destroy_workqueue(dev->wq);
+ 	kfree(dev);

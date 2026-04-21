@@ -326,3 +326,40 @@ Linux kernel 6.12.81 的 brcmfmac 模組樹，驗證 hwsim 與 sim_sdio.c 程式
 5. **FAILS** at `brcmf_cfg80211_attach: Failed to get D11 version (-52 ENOMSG)`
 
 **Next bug to squash**: Our BCDC ioctl table in hwsim_core.c lacks the iovar/dcmd that `brcmf_cfg80211_attach` issues for D11 revision. Need to check brcmf_cfg80211_attach source to identify which dcmd/iovar, add handler returning synthetic D11 rev (e.g., 0x29 for 11ac/ax-class chips).
+
+## Session Checkpoint — Milestone 2 kickoff (2026-04-21)
+- Milestone 1 fully validated: wlan0 up, wpa_supplicant cycle, dmesg 0/0.
+- User-approved scope: **option 3** — full hostapd+wpa_supplicant end-to-end over mock bus, with AP/STA inter-bsscfg data loopback.
+- M2 phase map added to task_plan.md (A..E). Handover protocol formally written.
+- Next exact action: **Phase M2-A** — implement `interface_create` v1 GET iovar handler in hwsim_core.c + emit `WLC_E_IF` ADD event so `iw dev wlan0 interface add wlan1 type __ap` creates wlan1.
+- Current dmesg blocker (observed): `brcmf_cfg80211_request_ap_if: failed to create interface(v1), err=-52` (BCME_UNSUPPORTED).
+- Handoff state: code = commit f7b675d90 on hwsim-dev; repo pushed at 5578e55 on origin/main.
+
+## Session Handover — 2026-04-21 M2-A partial + VM hang
+- Goal: Milestone 2 Phase A — make `iw dev wlan0 interface add wlan1 type __ap` create wlan1 netdev.
+- Phase status: M2-A in_progress (blocked by VM hang).
+- Done this session:
+  - Planned M2 (phases A-E) in task_plan.md with exit criteria + handover protocol.
+  - Implemented `interface_create` v1 iovar GET handler in hwsim_core.c (20-byte wl_interface_create_v1 layout).
+  - Implemented `hwsim_if_add_work_fn` workqueue emitting BRCMF_E_IF action=IF_ADD role=AP.
+  - Fixed stale-module bug in test script.
+- Exact next action:
+  1. Restart VM (pid in vm/qemu.pid).
+  2. Audit locking chain hwsim_send_event -> rx_data -> fweh -> brcmf_add_if -> register_netdev (rtnl_lock) vs what's held on the tx_ctl thread.
+  3. Bump if_add_work delay to >=50ms.
+  4. Re-test interface add.
+- Files changed (uncommitted): linux-6.12.81/.../brcmfmac/hwsim/hwsim_core.c (interface_create handler, hwsim_if_add_work_fn, hwsim_dev state fields, pr_info debug).
+- Git: hwsim-dev @ f7b675d90 (M1 final). overlay repo @ origin/main 5578e55. Current M2 work NOT yet committed.
+- Validation: module built, contains "interface_create"/"GET iovar" strings. Runtime: hang -> inconclusive functional state.
+- 3-strike status: 1 failure (VM hang). Not retried same code path — suspended for analysis.
+
+## M2-A ✅ COMPLETE — 2026-04-21
+- Root cause of VM hang: recursive mutex_lock on dev->lock inside interface_create handler. hwsim_tx_ctl already holds dev->lock at line 1102; the handler at line 691 tried to re-lock the non-recursive mutex => self-deadlock => kernel hung on the cfg80211 caller thread (which was holding rtnl).
+- Fix: removed redundant mutex_lock/unlock in interface_create handler (caller already serializes); also removed two debug pr_info lines.
+- Validation:
+  - `iw dev wlan0 interface add wlan1 type __ap` => rc=0
+  - `ip -br link` shows wlan1 with MAC 02:00:00:e8:53:00
+  - `ip link set wlan1 up` => OK, no dmesg noise
+- Lock-chain audit (sub-agent finding) confirmed: cfg80211 thread holds rtnl+wiphy while waiting; brcmf_fweh_event_worker on system_wq only wakes vif_wq via brcmf_notify_vif_event (no rtnl needed); register_netdev runs back in cfg80211 thread context (rtnl already held). Architecture is sound — only the self-deadlock blocked it.
+- Files changed: hwsim_core.c (interface_create handler cleanup, GET-iovar debug print removed).
+- Phase status: M2-A done. Ready to proceed to M2-B (hostapd on wlan1 — needs bss/ssid/bcn_prb/wsec iovars + WLC_SET_SSID/UP/AP dcmds + WLC_E_LINK).

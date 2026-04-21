@@ -1,0 +1,37 @@
+From 19267402133c84a3634a691b6d4d0542eb3d771d Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Fri, 17 Apr 2026 06:52:23 +0800
+Subject: [PATCH 01/15] brcmfmac: add BRCMF_BUSTYPE_SIM to bus type enum
+
+Add a new bus type identifier for the hwsim simulated bus.
+This will be used by the sim_sdio shim and common.c to identify
+the simulated bus type in brcmf_get_module_param() and other
+bus-type-dependent paths.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ include/linux/platform_data/brcmfmac.h | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/platform_data/brcmfmac.h b/include/linux/platform_data/brcmfmac.h
+index ec99b7b73..df84843ba 100644
+--- a/include/linux/platform_data/brcmfmac.h
++++ b/include/linux/platform_data/brcmfmac.h
+@@ -45,13 +45,14 @@
+  */
+ 
+ /**
+- * enum brcmf_bus_type - Bus type identifier. Currently SDIO, USB and PCIE are
+- *			 supported.
++ * enum brcmf_bus_type - Bus type identifier. Currently SDIO, USB, PCIE and
++ *			 SIM (hwsim) are supported.
+  */
+ enum brcmf_bus_type {
+ 	BRCMF_BUSTYPE_SDIO,
+ 	BRCMF_BUSTYPE_USB,
+-	BRCMF_BUSTYPE_PCIE
++	BRCMF_BUSTYPE_PCIE,
++	BRCMF_BUSTYPE_SIM
+ };
+ 
+ 

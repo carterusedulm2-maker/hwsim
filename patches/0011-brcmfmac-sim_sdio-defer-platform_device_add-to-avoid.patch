@@ -1,7 +1,7 @@
 From c2a710963eb7a0aea45e7674b5ea99464810c265 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Tue, 21 Apr 2026 22:10:17 +0800
-Subject: [PATCH 10/13] brcmfmac: sim_sdio: defer platform_device_add to avoid
+Subject: [PATCH 11/15] brcmfmac: sim_sdio: defer platform_device_add to avoid
  kmod deadlock
 
 Registering the platform_device in-line from brcmf_core_init() causes
@@ -108,6 +108,3 @@ index fc241fe63..d5a1c92d9 100644
  
  	if (sim_pdev) {
  		platform_device_unregister(sim_pdev);
--- 
-2.50.1 (Apple Git-155)
-

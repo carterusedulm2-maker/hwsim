@@ -1,7 +1,7 @@
 From cff0d6daea403baa71a379b447e73183508c05d8 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 07:04:02 +0800
-Subject: [PATCH 06/13] brcmfmac: add sim_sdio.c bus shim + BRCMF_SIM_VAL debug
+Subject: [PATCH 07/15] brcmfmac: add sim_sdio.c bus shim + BRCMF_SIM_VAL debug
  level
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -542,6 +542,3 @@ index 000000000..fc241fe63
 +		sim_pdev = NULL;
 +	}
 +}
--- 
-2.50.1 (Apple Git-155)
-

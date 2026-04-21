@@ -1,7 +1,7 @@
 From f7b675d904c8c10b01633b6e1d24a2144edc463b Mon Sep 17 00:00:00 2001
 From: hwsim dev <dev@hwsim>
 Date: Tue, 21 Apr 2026 22:23:09 +0800
-Subject: [PATCH 13/13] brcmfmac: hwsim: add qtxpower iovar handler
+Subject: [PATCH 14/15] brcmfmac: hwsim: add qtxpower iovar handler
 
 wpa_supplicant and cfg80211 .get_tx_power query this iovar.
 Returning a fixed 20 dBm (qdbm=80) eliminates the last
@@ -32,6 +32,3 @@ index e140700ae..413a8da96 100644
  	if (strcmp(iovar, "nmode") == 0 || strcmp(iovar, "vhtmode") == 0) {
  		__le32 val = cpu_to_le32(1);
  		hwsim_build_ok(dev, req, &val, sizeof(val));
--- 
-2.50.1 (Apple Git-155)
-
