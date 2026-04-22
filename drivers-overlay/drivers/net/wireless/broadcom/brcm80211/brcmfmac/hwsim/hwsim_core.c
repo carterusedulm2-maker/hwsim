@@ -287,9 +287,16 @@ static struct sk_buff *hwsim_alloc_event_skb(struct hwsim_dev *dev,
 	event->msg.ifidx = ifidx;
 	event->msg.bsscfgidx = ifidx;
 
-	/* Extra event data */
-	if (data && datalen > 0)
-		skb_put_data(skb, data, datalen);
+	/* Extra event data — always reserve the trailing room so callers
+	 * can fill it in-place; zero-init when no source buffer is given.
+	 */
+	if (datalen > 0) {
+		void *p = skb_put(skb, datalen);
+		if (data)
+			memcpy(p, data, datalen);
+		else
+			memset(p, 0, datalen);
+	}
 
 	return skb;
 }
@@ -316,13 +323,10 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	struct sk_buff *skb;
 	struct brcmf_escan_result_le *escan;
 	struct brcmf_bss_info_le *bi;
-	u8 ie_data[] = { /* SSID IE */
-		0x00, 0x08,
-		'H', 'W', 'S', 'I', 'M', '-', 'A', 'P',
-		/* Supported rates IE */
-		0x01, 0x04,
-		0x82, 0x84, 0x8b, 0x96,
-	};
+	const u8 *adv_ssid;
+	u8 adv_ssid_len;
+	u8 ie_data[2 + IEEE80211_MAX_SSID_LEN + 6];
+	int ie_len;
 	int bss_len, escan_len;
 
 	mutex_lock(&dev->lock);
@@ -339,9 +343,32 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 
 	dev->fi.event_count++;
 
+	/* Use the live AP SSID if hostapd has brought one up,
+	 * otherwise fall back to a built-in placeholder so a scan
+	 * always returns at least one result.
+	 */
+	if (dev->ap_started && dev->ap_ssid_len > 0) {
+		adv_ssid = dev->ap_ssid;
+		adv_ssid_len = dev->ap_ssid_len;
+	} else {
+		adv_ssid = (const u8 *)HWSIM_AP_SSID;
+		adv_ssid_len = strlen(HWSIM_AP_SSID);
+	}
+
+	/* Build SSID IE + Supported Rates IE */
+	ie_data[0] = 0x00;            /* SSID IE */
+	ie_data[1] = adv_ssid_len;
+	memcpy(&ie_data[2], adv_ssid, adv_ssid_len);
+	ie_data[2 + adv_ssid_len + 0] = 0x01;  /* Supported Rates IE */
+	ie_data[2 + adv_ssid_len + 1] = 0x04;
+	ie_data[2 + adv_ssid_len + 2] = 0x82;
+	ie_data[2 + adv_ssid_len + 3] = 0x84;
+	ie_data[2 + adv_ssid_len + 4] = 0x8b;
+	ie_data[2 + adv_ssid_len + 5] = 0x96;
+	ie_len = 2 + adv_ssid_len + 6;
+
 	/* Partial result with 1 BSS */
-	bss_len = offsetof(struct brcmf_bss_info_le, basic_mcs) +
-		  BRCMF_MCSSET_LEN + sizeof(ie_data);
+	bss_len = sizeof(struct brcmf_bss_info_le) + ie_len;
 	escan_len = sizeof(*escan) - sizeof(struct brcmf_bss_info_le) + bss_len;
 
 	skb = hwsim_alloc_event_skb(dev, BRCMF_E_ESCAN_RESULT,
@@ -364,21 +391,20 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	bi->length = cpu_to_le32(bss_len);
 	memcpy(bi->BSSID, HWSIM_AP_MAC, ETH_ALEN);
 	bi->beacon_period = cpu_to_le16(100);
-	bi->capability = cpu_to_le16(0x0431); /* ESS | Privacy | Short Preamble | Short Slot */
-	bi->SSID_len = strlen(HWSIM_AP_SSID);
-	memcpy(bi->SSID, HWSIM_AP_SSID, bi->SSID_len);
+	/* Open AP: ESS | Short Preamble | Short Slot (no Privacy) */
+	bi->capability = cpu_to_le16(0x0421);
+	bi->SSID_len = adv_ssid_len;
+	memcpy(bi->SSID, adv_ssid, adv_ssid_len);
 	bi->chanspec = cpu_to_le16(HWSIM_AP_CHANSPEC);
 	bi->RSSI = cpu_to_le16(HWSIM_AP_SIGNAL);
 	bi->phy_noise = -95;
 	bi->n_cap = 1;
 	bi->ctl_ch = HWSIM_AP_CHANNEL;
-	bi->ie_offset = cpu_to_le16(offsetof(struct brcmf_bss_info_le,
-					     basic_mcs) + BRCMF_MCSSET_LEN);
-	bi->ie_length = cpu_to_le32(sizeof(ie_data));
+	bi->ie_offset = cpu_to_le16(sizeof(struct brcmf_bss_info_le));
+	bi->ie_length = cpu_to_le32(ie_len);
 
 	/* Copy IEs after the fixed BSS fields */
-	memcpy((u8 *)bi + le16_to_cpu(bi->ie_offset), ie_data,
-	       sizeof(ie_data));
+	memcpy((u8 *)bi + le16_to_cpu(bi->ie_offset), ie_data, ie_len);
 
 	mutex_unlock(&dev->lock);
 	hwsim_send_event(dev, skb);

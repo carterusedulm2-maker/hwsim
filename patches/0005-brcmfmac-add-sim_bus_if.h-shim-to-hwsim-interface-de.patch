@@ -1,8 +1,7 @@
 From 4fe9cea1e42592a5c03c09e0a093d7149190b5b9 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:54:39 +0800
-Subject: [PATCH 05/17] brcmfmac: add sim_bus_if.h shim-to-hwsim interface
- definition
+Subject: [PATCH] brcmfmac: add sim_bus_if.h shim-to-hwsim interface definition
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

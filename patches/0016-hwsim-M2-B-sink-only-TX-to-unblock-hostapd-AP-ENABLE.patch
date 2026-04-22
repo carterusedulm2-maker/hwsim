@@ -1,7 +1,7 @@
 From b63a03210a2feecdde3919f7c68da47fd33966db Mon Sep 17 00:00:00 2001
 From: Carter <carter@local>
 Date: Wed, 22 Apr 2026 08:05:06 +0800
-Subject: [PATCH 16/17] hwsim: M2-B sink-only TX to unblock hostapd AP-ENABLED
+Subject: [PATCH] hwsim: M2-B sink-only TX to unblock hostapd AP-ENABLED
 
 brcmf_fws_rxreorder NULL-deref'd when our hwsim_tx_data echoed
 un-associated traffic (e.g. IPv6 MLD multicast right after netdev up)

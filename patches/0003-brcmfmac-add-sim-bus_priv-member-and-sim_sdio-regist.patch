@@ -1,8 +1,8 @@
 From 795e6a39adf5e2fb6910c30f6f5fcb3ca968fffc Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:53:23 +0800
-Subject: [PATCH 03/17] brcmfmac: add sim bus_priv member and sim_sdio
- register/exit declarations
+Subject: [PATCH] brcmfmac: add sim bus_priv member and sim_sdio register/exit
+ declarations
 
 - Add struct brcmf_sim_sdio forward declaration
 - Add 'sim' pointer to bus_priv union for hwsim shim private data

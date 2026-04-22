@@ -1,8 +1,7 @@
 From 078fbc57ed4ff86fc8192d752a39fcbecf1a429d Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:53:38 +0800
-Subject: [PATCH 04/17] brcmfmac: hook sim_sdio register/exit into core
- init/exit
+Subject: [PATCH] brcmfmac: hook sim_sdio register/exit into core init/exit
 
 Add brcmf_sim_sdio_register() and brcmf_sim_sdio_exit() calls to
 brcmf_core_init() and brcmf_core_exit() respectively, with proper

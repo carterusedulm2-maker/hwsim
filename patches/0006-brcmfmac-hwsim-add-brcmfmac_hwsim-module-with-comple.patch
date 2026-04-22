@@ -1,8 +1,8 @@
 From 6cfeb6cd8917ef7f6662dd7cc40336d09d26d010 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:59:44 +0800
-Subject: [PATCH 06/17] brcmfmac/hwsim: add brcmfmac_hwsim module with complete
- ioctl table
+Subject: [PATCH] brcmfmac/hwsim: add brcmfmac_hwsim module with complete ioctl
+ table
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

@@ -1,8 +1,8 @@
 From 062bcd7c36c33e7ae0f15af4cbd8900ee56b7c91 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Tue, 21 Apr 2026 22:20:38 +0800
-Subject: [PATCH 13/17] brcmfmac/hwsim: suppress HT 40MHz to silence bw40
- chanspec WARN
+Subject: [PATCH] brcmfmac/hwsim: suppress HT 40MHz to silence bw40 chanspec
+ WARN
 
 Return BCME_UNSUPPORTED for 'bw_cap' GET and 'mimo_bw_cap'/'bw_cap' SET
 so brcmf_enable_bw40_2g() bails out, causing cfg80211 to mask off
