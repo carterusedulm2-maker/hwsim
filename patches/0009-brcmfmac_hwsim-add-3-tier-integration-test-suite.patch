@@ -1,7 +1,7 @@
 From 487ceef9c692fc7709f8aa050576359e98f6274e Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 07:09:09 +0800
-Subject: [PATCH 09/16] brcmfmac_hwsim: add 3-tier integration test suite
+Subject: [PATCH 09/17] brcmfmac_hwsim: add 3-tier integration test suite
 
 Phase 18: Shell-based test suite with 3 tiers:
 

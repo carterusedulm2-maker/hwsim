@@ -1,7 +1,7 @@
 From a80d0c6bb4d95e4b89f30d17087b5ea9f834b50a Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Tue, 21 Apr 2026 22:17:59 +0800
-Subject: [PATCH 12/16] brcmfmac/hwsim: add GET_VERSION, per_chan_info,
+Subject: [PATCH 12/17] brcmfmac/hwsim: add GET_VERSION, per_chan_info,
  chanspecs handlers
 
 Completes Milestone 1: wlan0 successfully registers with cfg80211.

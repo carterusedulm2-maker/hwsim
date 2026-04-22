@@ -1,7 +1,7 @@
 From f7b675d904c8c10b01633b6e1d24a2144edc463b Mon Sep 17 00:00:00 2001
 From: hwsim dev <dev@hwsim>
 Date: Tue, 21 Apr 2026 22:23:09 +0800
-Subject: [PATCH 14/16] brcmfmac: hwsim: add qtxpower iovar handler
+Subject: [PATCH 14/17] brcmfmac: hwsim: add qtxpower iovar handler
 
 wpa_supplicant and cfg80211 .get_tx_power query this iovar.
 Returning a fixed 20 dBm (qdbm=80) eliminates the last

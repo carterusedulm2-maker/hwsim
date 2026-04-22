@@ -62,6 +62,8 @@ struct hwsim_bcdc_dcmd {
 #define HWSIM_AP_MAC		"\x02\x00\x00\x48\x53\x10"
 #define HWSIM_AP_SSID		"HWSIM-AP"
 #define HWSIM_AP_CHANNEL	1
+/* D11AC chanspec encoding: ch | BW_20 (0x1000) | BND_2G (0x0000) */
+#define HWSIM_AP_CHANSPEC	0x1001
 #define HWSIM_AP_SIGNAL		(-50)
 #define HWSIM_VERSION_STR	"wl0: Oct 01 2024 brcmfmac-hwsim-1.0"
 #define HWSIM_CLMVER_STR	"API: 0.0 Data: hwsim.0"
@@ -365,7 +367,7 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	bi->capability = cpu_to_le16(0x0431); /* ESS | Privacy | Short Preamble | Short Slot */
 	bi->SSID_len = strlen(HWSIM_AP_SSID);
 	memcpy(bi->SSID, HWSIM_AP_SSID, bi->SSID_len);
-	bi->chanspec = cpu_to_le16(HWSIM_AP_CHANNEL);
+	bi->chanspec = cpu_to_le16(HWSIM_AP_CHANSPEC);
 	bi->RSSI = cpu_to_le16(HWSIM_AP_SIGNAL);
 	bi->phy_noise = -95;
 	bi->n_cap = 1;
@@ -596,7 +598,7 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 	/* --- Scan related --- */
 
 	if (strcmp(iovar, "chanspec") == 0) {
-		__le32 val = cpu_to_le32(HWSIM_AP_CHANNEL);
+		__le32 val = cpu_to_le32(HWSIM_AP_CHANSPEC);
 		hwsim_build_ok(dev, req, &val, sizeof(val));
 		return 0;
 	}

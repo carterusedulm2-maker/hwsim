@@ -404,3 +404,10 @@ Will be addressed when implementing C_GET_BSS_INFO in M2-C/D.
 - M2-C scan path so wpa_supplicant on wlan0 sees the AP, OR
 - harden M2-B (fix decchspec oops + add explicit bsscfg dispatcher), OR
 - jump to M2-E data-plane per-BSS routing.
+
+## chanspec WARN cleanup ✅
+**Kernel commit**: `a2a6dcb14`
+HWSIM_AP_CHANNEL (=1) was being returned as `chanspec` iovar value and
+as bi->chanspec, but those fields require D11AC chanspec encoding.
+Added HWSIM_AP_CHANSPEC=0x1001 (ch1|BW20|2.4G).
+After fix: dmesg WARN count = 0; hostapd still reaches AP-ENABLED.

@@ -1,7 +1,7 @@
 From f48ee6a21e7f641fd312e1a6abf60349859d546e Mon Sep 17 00:00:00 2001
 From: Carter Chan <carter@local>
 Date: Wed, 22 Apr 2026 07:49:16 +0800
-Subject: [PATCH 15/16] brcmfmac: hwsim: implement interface_create iovar +
+Subject: [PATCH 15/17] brcmfmac: hwsim: implement interface_create iovar +
  IF_ADD event (M2-A)
 
 Add support for `iw dev wlan0 interface add wlan1 type __ap` so a second
