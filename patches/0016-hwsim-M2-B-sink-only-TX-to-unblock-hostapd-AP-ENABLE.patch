@@ -1,0 +1,63 @@
+From b63a03210a2feecdde3919f7c68da47fd33966db Mon Sep 17 00:00:00 2001
+From: Carter <carter@local>
+Date: Wed, 22 Apr 2026 08:05:06 +0800
+Subject: [PATCH 16/16] hwsim: M2-B sink-only TX to unblock hostapd AP-ENABLED
+
+brcmf_fws_rxreorder NULL-deref'd when our hwsim_tx_data echoed
+un-associated traffic (e.g. IPv6 MLD multicast right after netdev up)
+back into brcmf_rx_frame. Per-BSS data routing belongs in M2-E; for
+M2-B drop TX silently. The bus shim still calls brcmf_proto_bcdc_txcomplete()
+with the original skb so accounting stays consistent.
+
+With this + the existing default-accept SET-iovar handler:
+  hostapd /tmp/h.conf  ->  wlan1: AP-ENABLED
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 24 +++----------------
+ 1 file changed, 3 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index c0f8a576e..2207b9ec3 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -1144,8 +1144,6 @@ static int hwsim_rx_ctl(void *ctx, u8 *msg, uint len)
+ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
+ {
+ 	struct hwsim_dev *dev = ctx;
+-	struct sk_buff *rx_skb;
+-	u8 *bcdc_hdr;
+ 
+ 	if (!dev || dev->fw_state != HWSIM_FW_BOOTED)
+ 		return -ENODEV;
+@@ -1162,26 +1160,10 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
+ 		return 0; /* silently drop */
+ 
+ 	/*
+-	 * Loopback: clone the skb, rewrite the BCDC header for RX,
+-	 * and deliver back via rx_data callback.
+-	 * The original skb is NOT freed — the bus shim retains ownership
+-	 * and will pass it to brcmf_proto_bcdc_txcomplete().
++	 * M2-B: data-plane is sink-only. Per-BSS routing is M2-E.
++	 * Echoing back into brcmf_rx_frame on un-associated traffic
++	 * panics in brcmf_fws_rxreorder (e.g. on early IPv6 MLD bursts).
+ 	 */
+-	rx_skb = skb_copy(skb, GFP_KERNEL);
+-	if (!rx_skb)
+-		return -ENOMEM;
+-
+-	/* Rewrite BCDC data header for RX */
+-	if (rx_skb->len >= HWSIM_BCDC_HEADER_LEN) {
+-		bcdc_hdr = rx_skb->data;
+-		/* Set protocol version for RX */
+-		bcdc_hdr[0] = (HWSIM_BCDC_PROTO_VER <<
+-			       HWSIM_BCDC_FLAG_VER_SHIFT);
+-		/* ifidx stays the same for loopback */
+-	}
+-
+-	dev->fi.rx_count++;
+-	hwsim_send_event(dev, rx_skb);
+ 	return 0;
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

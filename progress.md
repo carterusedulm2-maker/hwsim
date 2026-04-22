@@ -363,3 +363,44 @@ Linux kernel 6.12.81 的 brcmfmac 模組樹，驗證 hwsim 與 sim_sdio.c 程式
 - Lock-chain audit (sub-agent finding) confirmed: cfg80211 thread holds rtnl+wiphy while waiting; brcmf_fweh_event_worker on system_wq only wakes vif_wq via brcmf_notify_vif_event (no rtnl needed); register_netdev runs back in cfg80211 thread context (rtnl already held). Architecture is sound — only the self-deadlock blocked it.
 - Files changed: hwsim_core.c (interface_create handler cleanup, GET-iovar debug print removed).
 - Phase status: M2-A done. Ready to proceed to M2-B (hostapd on wlan1 — needs bss/ssid/bcn_prb/wsec iovars + WLC_SET_SSID/UP/AP dcmds + WLC_E_LINK).
+
+## M2-B ✅ hostapd AP-ENABLED on wlan1 (sink-only TX path)
+
+**Date**: session continuation after compaction
+**Kernel commit**: `b63a03210` on hwsim-dev
+
+### Result
+```
+wlan1: interface state UNINITIALIZED->ENABLED
+wlan1: AP-ENABLED
+```
+hostapd v2.10 driver=nl80211 reached AP-ENABLED with no extra
+iovar handlers — existing `default: accept` path in hwsim_handle_set_var
+ACKs every unknown SET (including bsscfg:auth/wsec/wpa_auth/closednet/vndr_ie),
+and existing WLC_DOWN/UP/SET_AP/SET_INFRA/SET_BCNPRD/SET_DTIMPRD/SET_SSID
+handlers cover the dcmd path.
+
+### Root cause of prior VM hang (next-action investigation)
+Not hostapd. Just bringing wlan1 up triggered IPv6 MLD multicast TX:
+```
+brcmf_netdev_start_xmit -> brcmf_proto_bcdc_tx_queue_data ->
+  brcmf_proto_bcdc_txdata -> sim_bus_txdata -> hwsim_tx_data ->
+  hwsim_send_event -> sim_cb_rx_data -> brcmf_rx_frame ->
+  brcmf_proto_bcdc_rxreorder -> brcmf_fws_rxreorder NULL deref -> panic
+```
+Loopback for un-associated traffic is fundamentally unsafe; deferred to M2-E.
+
+### Fix
+hwsim_core.c hwsim_tx_data: drop SKB silently after fault-injection bookkeeping.
+Bus shim still calls brcmf_proto_bcdc_txcomplete on the original skb.
+
+### Residual non-fatal oops (deferred)
+`brcmu_d11ac_decchspec` NULL deref during `cfg80211_register_wdev` ->
+`brcmf_cfg80211_get_channel` for wlan1, because we never returned a real
+chanspec from C_GET_BSS_INFO. Non-blocking — hostapd still reaches AP-ENABLED.
+Will be addressed when implementing C_GET_BSS_INFO in M2-C/D.
+
+### Next decision gate
+- M2-C scan path so wpa_supplicant on wlan0 sees the AP, OR
+- harden M2-B (fix decchspec oops + add explicit bsscfg dispatcher), OR
+- jump to M2-E data-plane per-BSS routing.

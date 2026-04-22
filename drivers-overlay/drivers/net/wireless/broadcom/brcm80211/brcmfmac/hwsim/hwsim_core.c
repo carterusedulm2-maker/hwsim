@@ -1144,8 +1144,6 @@ static int hwsim_rx_ctl(void *ctx, u8 *msg, uint len)
 static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
 {
 	struct hwsim_dev *dev = ctx;
-	struct sk_buff *rx_skb;
-	u8 *bcdc_hdr;
 
 	if (!dev || dev->fw_state != HWSIM_FW_BOOTED)
 		return -ENODEV;
@@ -1162,26 +1160,10 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
 		return 0; /* silently drop */
 
 	/*
-	 * Loopback: clone the skb, rewrite the BCDC header for RX,
-	 * and deliver back via rx_data callback.
-	 * The original skb is NOT freed — the bus shim retains ownership
-	 * and will pass it to brcmf_proto_bcdc_txcomplete().
+	 * M2-B: data-plane is sink-only. Per-BSS routing is M2-E.
+	 * Echoing back into brcmf_rx_frame on un-associated traffic
+	 * panics in brcmf_fws_rxreorder (e.g. on early IPv6 MLD bursts).
 	 */
-	rx_skb = skb_copy(skb, GFP_KERNEL);
-	if (!rx_skb)
-		return -ENOMEM;
-
-	/* Rewrite BCDC data header for RX */
-	if (rx_skb->len >= HWSIM_BCDC_HEADER_LEN) {
-		bcdc_hdr = rx_skb->data;
-		/* Set protocol version for RX */
-		bcdc_hdr[0] = (HWSIM_BCDC_PROTO_VER <<
-			       HWSIM_BCDC_FLAG_VER_SHIFT);
-		/* ifidx stays the same for loopback */
-	}
-
-	dev->fi.rx_count++;
-	hwsim_send_event(dev, rx_skb);
 	return 0;
 }
 

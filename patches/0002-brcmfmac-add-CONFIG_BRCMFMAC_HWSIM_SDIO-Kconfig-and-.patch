@@ -1,7 +1,7 @@
 From a92a08bd8cf501a140ad1296947eed2c4df02c92 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:52:49 +0800
-Subject: [PATCH 02/15] brcmfmac: add CONFIG_BRCMFMAC_HWSIM_SDIO Kconfig and
+Subject: [PATCH 02/16] brcmfmac: add CONFIG_BRCMFMAC_HWSIM_SDIO Kconfig and
  Makefile entry
 
 Add Kconfig option for SDIO hwsim bus simulation:
@@ -54,3 +54,6 @@ index e5ca0f511..8e90292a2 100644
  brcmfmac-$(CONFIG_BRCMDBG) += \
  		debug.o
  brcmfmac-$(CONFIG_BRCM_TRACING) += \
+-- 
+2.50.1 (Apple Git-155)
+
