@@ -1,7 +1,7 @@
 From 19267402133c84a3634a691b6d4d0542eb3d771d Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:52:23 +0800
-Subject: [PATCH] brcmfmac: add BRCMF_BUSTYPE_SIM to bus type enum
+Subject: [PATCH 01/19] brcmfmac: add BRCMF_BUSTYPE_SIM to bus type enum
 
 Add a new bus type identifier for the hwsim simulated bus.
 This will be used by the sim_sdio shim and common.c to identify

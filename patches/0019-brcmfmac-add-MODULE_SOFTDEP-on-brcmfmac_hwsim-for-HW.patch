@@ -1,0 +1,37 @@
+From da05321822d7b5b8974b51bdcc5bf791ff0fc1e0 Mon Sep 17 00:00:00 2001
+From: Carter Chen <carterchan50@gmail.com>
+Date: Thu, 23 Apr 2026 22:13:20 +0800
+Subject: [PATCH 19/19] brcmfmac: add MODULE_SOFTDEP on brcmfmac_hwsim for
+ HWSIM build
+
+When CONFIG_BRCMFMAC_HWSIM_SDIO=y or CONFIG_BRCMFMAC_HWSIM_PCIE=y,
+brcmfmac's sim_*_probe() resolves brcmfmac_hwsim_get_ops via
+symbol_get(); the helper module must be present beforehand.
+Adding MODULE_SOFTDEP makes 'modprobe brcmfmac' auto-load
+brcmfmac_hwsim first.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+index b24faae35..2eada26e3 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/common.c
+@@ -24,6 +24,12 @@
+ MODULE_AUTHOR("Broadcom Corporation");
+ MODULE_DESCRIPTION("Broadcom 802.11 wireless LAN fullmac driver.");
+ MODULE_LICENSE("Dual BSD/GPL");
++#if IS_ENABLED(CONFIG_BRCMFMAC_HWSIM_SDIO) || IS_ENABLED(CONFIG_BRCMFMAC_HWSIM_PCIE)
++/* The HWSIM mock-bus build requires brcmfmac_hwsim to register virtual-firmware
++ * ops before sim_*_probe() runs; otherwise probe fails with -ENODEV.
++ */
++MODULE_SOFTDEP("pre: brcmfmac_hwsim");
++#endif
+ 
+ #define BRCMF_DEFAULT_SCAN_CHANNEL_TIME	40
+ #define BRCMF_DEFAULT_SCAN_UNASSOC_TIME	40
+-- 
+2.50.1 (Apple Git-155)
+

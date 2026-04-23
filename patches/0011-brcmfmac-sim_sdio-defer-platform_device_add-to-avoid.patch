@@ -1,8 +1,8 @@
 From c2a710963eb7a0aea45e7674b5ea99464810c265 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Tue, 21 Apr 2026 22:10:17 +0800
-Subject: [PATCH] brcmfmac: sim_sdio: defer platform_device_add to avoid kmod
- deadlock
+Subject: [PATCH 11/19] brcmfmac: sim_sdio: defer platform_device_add to avoid
+ kmod deadlock
 
 Registering the platform_device in-line from brcmf_core_init() causes
 sim_sdio_probe() to run while module_mutex is still held by the parent

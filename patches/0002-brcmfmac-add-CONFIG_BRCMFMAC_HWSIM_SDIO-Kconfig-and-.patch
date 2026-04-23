@@ -1,8 +1,8 @@
 From a92a08bd8cf501a140ad1296947eed2c4df02c92 Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Fri, 17 Apr 2026 06:52:49 +0800
-Subject: [PATCH] brcmfmac: add CONFIG_BRCMFMAC_HWSIM_SDIO Kconfig and Makefile
- entry
+Subject: [PATCH 02/19] brcmfmac: add CONFIG_BRCMFMAC_HWSIM_SDIO Kconfig and
+ Makefile entry
 
 Add Kconfig option for SDIO hwsim bus simulation:
 - Selects BRCMFMAC_PROTO_BCDC (uses BCDC protocol like real SDIO)

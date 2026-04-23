@@ -1,8 +1,9 @@
 From 8fd23817ac86b9a434c86548541e3cd92cd913ed Mon Sep 17 00:00:00 2001
 From: Carter Chen <carterchan50@gmail.com>
 Date: Wed, 22 Apr 2026 13:51:01 +0800
-Subject: [PATCH] =?UTF-8?q?brcmfmac/hwsim:=20M2-C=20escan=20=E2=80=94=20fi?=
- =?UTF-8?q?x=20ie=5Foffset/length=20corruption,=20dynamic=20SSID?=
+Subject: [PATCH 18/19] =?UTF-8?q?brcmfmac/hwsim:=20M2-C=20escan=20?=
+ =?UTF-8?q?=E2=80=94=20fix=20ie=5Foffset/length=20corruption,=20dynamic=20?=
+ =?UTF-8?q?SSID?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

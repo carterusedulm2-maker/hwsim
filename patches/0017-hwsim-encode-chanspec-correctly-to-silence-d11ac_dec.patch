@@ -1,8 +1,8 @@
 From a2a6dcb14fa386a879aa1a3ce0cb760b4cb5ac28 Mon Sep 17 00:00:00 2001
 From: Carter <carter@local>
 Date: Wed, 22 Apr 2026 13:39:27 +0800
-Subject: [PATCH] hwsim: encode chanspec correctly to silence d11ac_decchspec
- WARN
+Subject: [PATCH 17/19] hwsim: encode chanspec correctly to silence
+ d11ac_decchspec WARN
 
 HWSIM_AP_CHANNEL=1 was being returned for the 'chanspec' iovar and as
 bi->chanspec in BSS_INFO, but those fields expect a D11AC chanspec
