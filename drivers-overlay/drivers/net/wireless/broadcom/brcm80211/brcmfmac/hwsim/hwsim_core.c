@@ -131,6 +131,7 @@ struct hwsim_dev {
 	struct mutex lock;
 	struct delayed_work scan_work;
 	struct delayed_work connect_work;
+	struct delayed_work disconnect_work;
 	struct delayed_work if_add_work;
 	struct workqueue_struct *wq;
 
@@ -525,6 +526,62 @@ static void hwsim_connect_work_fn(struct work_struct *work)
 
 	/* (3) AP-side ASSOC_IND so hostapd's cfg80211 path runs new_sta. */
 	hwsim_emit_assoc_ind(dev);
+
+	mutex_unlock(&dev->lock);
+}
+
+/* ======================================================================
+ * Disconnect event generator (workqueue) — M2-D follow-up
+ *
+ * Driven by BRCMF_C_DISASSOC ioctl. The ioctl handler clears
+ * dev->associated synchronously (so the next connect can run); the
+ * actual cfg80211 notifications must run async with the lock dropped:
+ *
+ *   1. STA-side BRCMF_E_LINK(flags=0, addr=AP_MAC)
+ *        → brcmf_is_linkdown() → brcmf_link_down() → cfg80211_disconnected()
+ *   2. AP-side  BRCMF_E_DISASSOC_IND(SUCCESS, addr=STA_MAC, ifidx=ap_ifidx)
+ *        → AP-side notify_connect_status branch calls cfg80211_del_sta()
+ * ====================================================================== */
+
+static void hwsim_disconnect_work_fn(struct work_struct *work)
+{
+	struct hwsim_dev *dev = container_of(work, struct hwsim_dev,
+					     disconnect_work.work);
+	struct sk_buff *skb;
+
+	mutex_lock(&dev->lock);
+	if (dev->detached) {
+		mutex_unlock(&dev->lock);
+		return;
+	}
+
+	/* Fault injection: drop disconnect events (bit 1, shared with connect) */
+	if (dev->fi.drop_events & 0x02) {
+		mutex_unlock(&dev->lock);
+		return;
+	}
+
+	dev->fi.event_count++;
+
+	/* (1) STA-side LINK down event (no LINK flag) */
+	skb = hwsim_alloc_event_skb(dev, BRCMF_E_LINK,
+				    BRCMF_E_STATUS_SUCCESS, 0,
+				    0,
+				    (const u8 *)HWSIM_AP_MAC, 0,
+				    NULL, 0);
+	if (skb)
+		hwsim_send_event(dev, skb);
+
+	/* (2) AP-side DISASSOC_IND so hostapd drops the STA */
+	if (dev->ap_iface_created && dev->ap_started) {
+		skb = hwsim_alloc_event_skb(dev, BRCMF_E_DISASSOC_IND,
+					    BRCMF_E_STATUS_SUCCESS, 0, 0,
+					    dev->mac_addr,
+					    dev->ap_iface_ifidx,
+					    NULL, 0);
+		if (skb)
+			hwsim_send_event(dev, skb);
+	}
 
 	mutex_unlock(&dev->lock);
 }
@@ -1144,10 +1201,15 @@ static int hwsim_handle_cmd(struct hwsim_dev *dev,
 		return 0;
 	}
 
-	case BRCMF_C_DISASSOC:
+	case BRCMF_C_DISASSOC: {
+		bool was_assoc = dev->associated;
 		dev->associated = false;
 		hwsim_build_ok(dev, req, NULL, 0);
+		if (was_assoc)
+			queue_delayed_work(dev->wq, &dev->disconnect_work,
+					   msecs_to_jiffies(20));
 		return 0;
+	}
 
 	case BRCMF_C_GET_WSEC:
 	case BRCMF_C_GET_AUTH: {
@@ -1297,6 +1359,7 @@ static void hwsim_detach(void *ctx)
 
 	cancel_delayed_work_sync(&dev->scan_work);
 	cancel_delayed_work_sync(&dev->connect_work);
+	cancel_delayed_work_sync(&dev->disconnect_work);
 	cancel_delayed_work_sync(&dev->if_add_work);
 
 	pr_info("brcmfmac_hwsim: detached\n");
@@ -1467,6 +1530,7 @@ static struct hwsim_dev *hwsim_dev_alloc(void)
 
 	INIT_DELAYED_WORK(&dev->scan_work, hwsim_scan_work_fn);
 	INIT_DELAYED_WORK(&dev->connect_work, hwsim_connect_work_fn);
+	INIT_DELAYED_WORK(&dev->disconnect_work, hwsim_disconnect_work_fn);
 	INIT_DELAYED_WORK(&dev->if_add_work, hwsim_if_add_work_fn);
 
 	dev->wq = alloc_ordered_workqueue("brcmfmac_hwsim", 0);
@@ -1485,6 +1549,7 @@ static void hwsim_dev_free(struct hwsim_dev *dev)
 
 	cancel_delayed_work_sync(&dev->scan_work);
 	cancel_delayed_work_sync(&dev->connect_work);
+	cancel_delayed_work_sync(&dev->disconnect_work);
 	cancel_delayed_work_sync(&dev->if_add_work);
 	if (dev->wq)
 		destroy_workqueue(dev->wq);

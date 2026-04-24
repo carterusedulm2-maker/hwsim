@@ -1,0 +1,153 @@
+From b84a1cf3495be77f0595488b7199462eef20fbfc Mon Sep 17 00:00:00 2001
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Date: Fri, 24 Apr 2026 20:34:34 +0800
+Subject: [PATCH] =?UTF-8?q?brcmfmac/hwsim:=20M2-D=20follow-up=20=E2=80=94?=
+ =?UTF-8?q?=20full=20DISASSOC=20path?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add async disconnect_work that fires on BRCMF_C_DISASSOC ioctl:
+
+  1. STA-side BRCMF_E_LINK with flags=0 (no LINK bit). This is the
+     'link down' edge brcmf_is_linkdown() in cfg80211.c looks for,
+     which in turn drives brcmf_link_down() -> cfg80211_disconnected().
+
+  2. AP-side BRCMF_E_DISASSOC_IND addressed to the AP ifidx. This makes
+     brcmf_notify_connect_status_ap() call cfg80211_del_sta() so hostapd
+     drops the client from its station table.
+
+The DISASSOC ioctl handler itself still clears dev->associated
+synchronously (so a subsequent connect_work isn't blocked by the
+idempotency guard) but only schedules the work if was_assoc was true,
+so repeated DISASSOCs (wpa_supplicant retry) don't spam events.
+
+Verified: regression PASS=9/9 (added Phase 6 disconnect checks),
+idempotent across two consecutive runs, dmesg clean. STA reaches
+DISCONNECTED at t<=1s, hostapd_cli all_sta empties within ~1-3s of
+wpa_cli disconnect.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 67 ++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index c1b2a536f..c8c10a80c 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -131,6 +131,7 @@ struct hwsim_dev {
+ 	struct mutex lock;
+ 	struct delayed_work scan_work;
+ 	struct delayed_work connect_work;
++	struct delayed_work disconnect_work;
+ 	struct delayed_work if_add_work;
+ 	struct workqueue_struct *wq;
+ 
+@@ -529,6 +530,62 @@ static void hwsim_connect_work_fn(struct work_struct *work)
+ 	mutex_unlock(&dev->lock);
+ }
+ 
++/* ======================================================================
++ * Disconnect event generator (workqueue) — M2-D follow-up
++ *
++ * Driven by BRCMF_C_DISASSOC ioctl. The ioctl handler clears
++ * dev->associated synchronously (so the next connect can run); the
++ * actual cfg80211 notifications must run async with the lock dropped:
++ *
++ *   1. STA-side BRCMF_E_LINK(flags=0, addr=AP_MAC)
++ *        → brcmf_is_linkdown() → brcmf_link_down() → cfg80211_disconnected()
++ *   2. AP-side  BRCMF_E_DISASSOC_IND(SUCCESS, addr=STA_MAC, ifidx=ap_ifidx)
++ *        → AP-side notify_connect_status branch calls cfg80211_del_sta()
++ * ====================================================================== */
++
++static void hwsim_disconnect_work_fn(struct work_struct *work)
++{
++	struct hwsim_dev *dev = container_of(work, struct hwsim_dev,
++					     disconnect_work.work);
++	struct sk_buff *skb;
++
++	mutex_lock(&dev->lock);
++	if (dev->detached) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++
++	/* Fault injection: drop disconnect events (bit 1, shared with connect) */
++	if (dev->fi.drop_events & 0x02) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++
++	dev->fi.event_count++;
++
++	/* (1) STA-side LINK down event (no LINK flag) */
++	skb = hwsim_alloc_event_skb(dev, BRCMF_E_LINK,
++				    BRCMF_E_STATUS_SUCCESS, 0,
++				    0,
++				    (const u8 *)HWSIM_AP_MAC, 0,
++				    NULL, 0);
++	if (skb)
++		hwsim_send_event(dev, skb);
++
++	/* (2) AP-side DISASSOC_IND so hostapd drops the STA */
++	if (dev->ap_iface_created && dev->ap_started) {
++		skb = hwsim_alloc_event_skb(dev, BRCMF_E_DISASSOC_IND,
++					    BRCMF_E_STATUS_SUCCESS, 0, 0,
++					    dev->mac_addr,
++					    dev->ap_iface_ifidx,
++					    NULL, 0);
++		if (skb)
++			hwsim_send_event(dev, skb);
++	}
++
++	mutex_unlock(&dev->lock);
++}
++
+ /* ======================================================================
+  * IF-ADD event generator (workqueue) — Milestone 2 Phase A
+  *
+@@ -1144,10 +1201,15 @@ static int hwsim_handle_cmd(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
+-	case BRCMF_C_DISASSOC:
++	case BRCMF_C_DISASSOC: {
++		bool was_assoc = dev->associated;
+ 		dev->associated = false;
+ 		hwsim_build_ok(dev, req, NULL, 0);
++		if (was_assoc)
++			queue_delayed_work(dev->wq, &dev->disconnect_work,
++					   msecs_to_jiffies(20));
+ 		return 0;
++	}
+ 
+ 	case BRCMF_C_GET_WSEC:
+ 	case BRCMF_C_GET_AUTH: {
+@@ -1297,6 +1359,7 @@ static void hwsim_detach(void *ctx)
+ 
+ 	cancel_delayed_work_sync(&dev->scan_work);
+ 	cancel_delayed_work_sync(&dev->connect_work);
++	cancel_delayed_work_sync(&dev->disconnect_work);
+ 	cancel_delayed_work_sync(&dev->if_add_work);
+ 
+ 	pr_info("brcmfmac_hwsim: detached\n");
+@@ -1467,6 +1530,7 @@ static struct hwsim_dev *hwsim_dev_alloc(void)
+ 
+ 	INIT_DELAYED_WORK(&dev->scan_work, hwsim_scan_work_fn);
+ 	INIT_DELAYED_WORK(&dev->connect_work, hwsim_connect_work_fn);
++	INIT_DELAYED_WORK(&dev->disconnect_work, hwsim_disconnect_work_fn);
+ 	INIT_DELAYED_WORK(&dev->if_add_work, hwsim_if_add_work_fn);
+ 
+ 	dev->wq = alloc_ordered_workqueue("brcmfmac_hwsim", 0);
+@@ -1485,6 +1549,7 @@ static void hwsim_dev_free(struct hwsim_dev *dev)
+ 
+ 	cancel_delayed_work_sync(&dev->scan_work);
+ 	cancel_delayed_work_sync(&dev->connect_work);
++	cancel_delayed_work_sync(&dev->disconnect_work);
+ 	cancel_delayed_work_sync(&dev->if_add_work);
+ 	if (dev->wq)
+ 		destroy_workqueue(dev->wq);
+-- 
+2.50.1 (Apple Git-155)
+

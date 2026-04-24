@@ -134,6 +134,32 @@ else
   fail "AP all_sta empty"
 fi
 
+# M2-D disconnect path: wpa_cli disconnect → BRCMF_C_DISASSOC →
+# expect STA wpa_state to leave COMPLETED and AP all_sta to empty.
+wpa_cli -i wlan0 disconnect >/dev/null
+DISC_OK=0
+for i in 1 2 3 4 5 6 7 8; do
+  ST=$(wpa_cli -i wlan0 status 2>/dev/null | awk -F= '/^wpa_state/{print $2}')
+  if [ "$ST" != "COMPLETED" ] && [ -n "$ST" ]; then DISC_OK=1; break; fi
+  sleep 1
+done
+if [ "$DISC_OK" = "1" ]; then
+  ok "STA disconnect → wpa_state=$ST at t=${i}s"
+else
+  fail "STA still COMPLETED after disconnect"
+fi
+STA_LIST=""
+for i in 1 2 3 4 5; do
+  STA_LIST=$(hostapd_cli -i wlan1 all_sta 2>/dev/null)
+  [ -z "$(echo "$STA_LIST" | grep -E '^[0-9a-f:]{17}$')" ] && break
+  sleep 1
+done
+if [ -z "$(echo "$STA_LIST" | grep -E '^[0-9a-f:]{17}$')" ]; then
+  ok "AP all_sta empty after disconnect"
+else
+  fail "AP still has STA after disconnect: $STA_LIST"
+fi
+
 log "Phase 7: dmesg cleanliness"
 BAD=$(dmesg | grep -iE 'WARN|BUG:|oops|null deref|unable to handle|panic|RIP:|Call Trace' || true)
 if [ -z "$BAD" ]; then
