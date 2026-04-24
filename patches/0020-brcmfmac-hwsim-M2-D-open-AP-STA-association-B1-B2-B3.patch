@@ -1,0 +1,170 @@
+From 94671281f284e75363e3c3328be94d4cf74f398a Mon Sep 17 00:00:00 2001
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Date: Fri, 24 Apr 2026 20:29:10 +0800
+Subject: [PATCH] =?UTF-8?q?brcmfmac/hwsim:=20M2-D=20=E2=80=94=20open-AP=20?=
+ =?UTF-8?q?STA=20association=20(B1+B2+B3)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Implement the three iovar/event gaps that prevented wpa_supplicant from
+reaching wpa_state=COMPLETED on an open-auth network served by hostapd
+on the same hwsim instance:
+
+B1 (event sequence): hwsim_connect_work_fn now emits SET_SSID(SUCCESS,
+   addr=AP_MAC) followed by LINK(LINK flag, addr=AP_MAC). brcmf_is_linkup()
+   only returns true on SET_SSID(SUCCESS) for FWSUP_NONE; bare LINK was
+   silently dropped, so connect_done never fired.
+
+B2 (assoc_info iovar): add GET handler returning
+   brcmf_cfg80211_assoc_ielen_le {req_len=0, resp_len=0}. Without this
+   brcmf_get_assoc_ies() failed with BCME_UNSUPPORTED -> bphy_err and
+   the connect was aborted before cfg80211 was notified.
+
+B3 (AP-side ASSOC_IND): new hwsim_emit_assoc_ind() helper sends
+   BRCMF_E_ASSOC_IND to the AP ifidx (dev->ap_iface_ifidx) carrying a
+   minimal SSID-IE blob, so cfg80211_new_sta() populates the hostapd
+   MAC table.
+
+Add an idempotency guard (dev->associated) so wpa_supplicant retry
+cycles do not re-emit the connect events.
+
+Verified end-to-end on QEMU aarch64 / Linux 6.12.81-hwsim-hwsim:
+  - wpa_state=COMPLETED at t<=2s
+  - hostapd_cli all_sta shows STA 02:00:00:48:53:00 [AUTH][ASSOC][AUTHORIZED]
+  - dmesg clean (no WARN/BUG/oops)
+  - regression.sh PASS=7/7, idempotent across consecutive runs
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ .../brcm80211/brcmfmac/hwsim/hwsim_core.c     | 81 ++++++++++++++++++-
+ 1 file changed, 77 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+index aa68a6a80..c1b2a536f 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/hwsim/hwsim_core.c
+@@ -27,6 +27,7 @@
+ #include "fwil.h"
+ #include "fwil_types.h"
+ #include "fweh.h"
++#include "cfg80211.h"
+ #include "sim_bus_if.h"
+ 
+ /* BCDC protocol definitions (mirrored from bcdc.c) */
+@@ -433,9 +434,46 @@ static void hwsim_scan_work_fn(struct work_struct *work)
+ }
+ 
+ /* ======================================================================
+- * Connect event generator (workqueue)
++ * Connect event generator (workqueue) — M2-D
++ *
++ * On STA-side bsscfg:join (or BRCMF_C_SET_SSID fallback), we must inject
++ * the events that drive cfg80211_connect_done() and AP-side cfg80211_new_sta().
++ * For open auth (use_fwsup == FWSUP_NONE), brcmf_is_linkup() in cfg80211.c
++ * only returns true on BRCMF_E_SET_SSID(SUCCESS); a bare LINK event is
++ * silently ignored. So we send:
++ *   1. STA-side BRCMF_E_SET_SSID(SUCCESS, addr=AP_MAC)
++ *        → drives brcmf_bss_connect_done(success=true) + carrier UP
++ *   2. STA-side BRCMF_E_LINK(LINK flag, addr=AP_MAC) (defensive; harmless)
++ *   3. AP-side  BRCMF_E_ASSOC_IND(SUCCESS, addr=STA_MAC, data=min IE)
++ *        → drives cfg80211_new_sta() so hostapd sees the client
+  * ====================================================================== */
+ 
++static void hwsim_emit_assoc_ind(struct hwsim_dev *dev)
++{
++	/* Minimal IE blob: SSID-IE so hostapd has at least one element to log. */
++	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
++	u32 ie_len;
++	struct sk_buff *skb;
++	u8 ap_ifidx;
++
++	if (!dev->ap_iface_created || !dev->ap_started)
++		return;
++
++	ap_ifidx = dev->ap_iface_ifidx;
++	ie[0] = 0; /* WLAN_EID_SSID */
++	ie[1] = dev->ap_ssid_len;
++	if (dev->ap_ssid_len)
++		memcpy(ie + 2, dev->ap_ssid, dev->ap_ssid_len);
++	ie_len = 2 + dev->ap_ssid_len;
++
++	skb = hwsim_alloc_event_skb(dev, BRCMF_E_ASSOC_IND,
++				    BRCMF_E_STATUS_SUCCESS, 0, 0,
++				    dev->mac_addr, ap_ifidx,
++				    ie, ie_len);
++	if (skb)
++		hwsim_send_event(dev, skb);
++}
++
+ static void hwsim_connect_work_fn(struct work_struct *work)
+ {
+ 	struct hwsim_dev *dev = container_of(work, struct hwsim_dev,
+@@ -454,19 +492,41 @@ static void hwsim_connect_work_fn(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	/* Idempotency: skip if already associated (wpa_supplicant may
++	 * fire bsscfg:join multiple times during scan retries).
++	 */
++	if (dev->associated) {
++		mutex_unlock(&dev->lock);
++		return;
++	}
++
+ 	dev->fi.event_count++;
+ 	dev->associated = true;
+ 
+-	/* Send BRCMF_E_LINK with LINK flag set */
++	/* (1) STA-side SET_SSID(SUCCESS, addr=AP_MAC) drives connect_done. */
++	skb = hwsim_alloc_event_skb(dev, BRCMF_E_SET_SSID,
++				    BRCMF_E_STATUS_SUCCESS, 0, 0,
++				    (const u8 *)HWSIM_AP_MAC, 0,
++				    NULL, 0);
++	if (skb)
++		hwsim_send_event(dev, skb);
++
++	/* (2) STA-side LINK(up). For non-FWSUP this is a noop in is_linkup,
++	 * but it sets carrier-up correctly through brcmf_net_setcarrier()
++	 * code path on real firmware; safe to emit.
++	 */
+ 	skb = hwsim_alloc_event_skb(dev, BRCMF_E_LINK,
+ 				    BRCMF_E_STATUS_SUCCESS, 0,
+ 				    BRCMF_EVENT_MSG_LINK,
+ 				    (const u8 *)HWSIM_AP_MAC, 0,
+ 				    NULL, 0);
+-	mutex_unlock(&dev->lock);
+-
+ 	if (skb)
+ 		hwsim_send_event(dev, skb);
++
++	/* (3) AP-side ASSOC_IND so hostapd's cfg80211 path runs new_sta. */
++	hwsim_emit_assoc_ind(dev);
++
++	mutex_unlock(&dev->lock);
+ }
+ 
+ /* ======================================================================
+@@ -675,6 +735,19 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
+ 		return 0;
+ 	}
+ 
++	/* M2-D: brcmf_get_assoc_ies() expects this struct on connect_done().
++	 * Returning req_len=0/resp_len=0 makes the driver skip the follow-on
++	 * iovar GETs for assoc_req_ies / assoc_resp_ies / wme_ac_sta.
++	 */
++	if (strcmp(iovar, "assoc_info") == 0) {
++		struct brcmf_cfg80211_assoc_ielen_le info = {
++			.req_len  = cpu_to_le32(0),
++			.resp_len = cpu_to_le32(0),
++		};
++		hwsim_build_ok(dev, req, &info, sizeof(info));
++		return 0;
++	}
++
+ 	if (strcmp(iovar, "interface_create") == 0) {
+ 		/*
+ 		 * expects firmware to return the same layout with the allocated
+-- 
+2.50.1 (Apple Git-155)
+

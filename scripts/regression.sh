@@ -108,7 +108,33 @@ else
   fail "scan_results missing $SSID"
 fi
 
-log "Phase 5: dmesg cleanliness"
+log "Phase 6: M2-D — STA association to brcmsim AP"
+# Add brcmsim network and trigger reconnect
+NETID=$(wpa_cli -i wlan0 add_network 2>/dev/null | tail -1)
+wpa_cli -i wlan0 set_network "$NETID" ssid "\"$SSID\"" >/dev/null
+wpa_cli -i wlan0 set_network "$NETID" key_mgmt NONE  >/dev/null
+wpa_cli -i wlan0 set_network "$NETID" scan_ssid 1    >/dev/null
+wpa_cli -i wlan0 enable_network "$NETID" >/dev/null
+wpa_cli -i wlan0 reconnect >/dev/null
+ASSOC_OK=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  ST=$(wpa_cli -i wlan0 status 2>/dev/null | awk -F= '/^wpa_state/{print $2}')
+  if [ "$ST" = "COMPLETED" ]; then ASSOC_OK=1; break; fi
+  sleep 1
+done
+if [ "$ASSOC_OK" = "1" ]; then
+  ok "wpa_state=COMPLETED at t=${i}s"
+else
+  fail "wpa_state never reached COMPLETED (last=$ST)"
+fi
+STA_LIST=$(hostapd_cli -i wlan1 all_sta 2>/dev/null)
+if echo "$STA_LIST" | grep -qE '^[0-9a-f:]{17}$'; then
+  ok "AP sees STA: $(echo "$STA_LIST" | head -1)"
+else
+  fail "AP all_sta empty"
+fi
+
+log "Phase 7: dmesg cleanliness"
 BAD=$(dmesg | grep -iE 'WARN|BUG:|oops|null deref|unable to handle|panic|RIP:|Call Trace' || true)
 if [ -z "$BAD" ]; then
   ok "dmesg clean"

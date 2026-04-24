@@ -27,6 +27,7 @@
 #include "fwil.h"
 #include "fwil_types.h"
 #include "fweh.h"
+#include "cfg80211.h"
 #include "sim_bus_if.h"
 
 /* BCDC protocol definitions (mirrored from bcdc.c) */
@@ -433,8 +434,45 @@ done:
 }
 
 /* ======================================================================
- * Connect event generator (workqueue)
+ * Connect event generator (workqueue) — M2-D
+ *
+ * On STA-side bsscfg:join (or BRCMF_C_SET_SSID fallback), we must inject
+ * the events that drive cfg80211_connect_done() and AP-side cfg80211_new_sta().
+ * For open auth (use_fwsup == FWSUP_NONE), brcmf_is_linkup() in cfg80211.c
+ * only returns true on BRCMF_E_SET_SSID(SUCCESS); a bare LINK event is
+ * silently ignored. So we send:
+ *   1. STA-side BRCMF_E_SET_SSID(SUCCESS, addr=AP_MAC)
+ *        → drives brcmf_bss_connect_done(success=true) + carrier UP
+ *   2. STA-side BRCMF_E_LINK(LINK flag, addr=AP_MAC) (defensive; harmless)
+ *   3. AP-side  BRCMF_E_ASSOC_IND(SUCCESS, addr=STA_MAC, data=min IE)
+ *        → drives cfg80211_new_sta() so hostapd sees the client
  * ====================================================================== */
+
+static void hwsim_emit_assoc_ind(struct hwsim_dev *dev)
+{
+	/* Minimal IE blob: SSID-IE so hostapd has at least one element to log. */
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+	u32 ie_len;
+	struct sk_buff *skb;
+	u8 ap_ifidx;
+
+	if (!dev->ap_iface_created || !dev->ap_started)
+		return;
+
+	ap_ifidx = dev->ap_iface_ifidx;
+	ie[0] = 0; /* WLAN_EID_SSID */
+	ie[1] = dev->ap_ssid_len;
+	if (dev->ap_ssid_len)
+		memcpy(ie + 2, dev->ap_ssid, dev->ap_ssid_len);
+	ie_len = 2 + dev->ap_ssid_len;
+
+	skb = hwsim_alloc_event_skb(dev, BRCMF_E_ASSOC_IND,
+				    BRCMF_E_STATUS_SUCCESS, 0, 0,
+				    dev->mac_addr, ap_ifidx,
+				    ie, ie_len);
+	if (skb)
+		hwsim_send_event(dev, skb);
+}
 
 static void hwsim_connect_work_fn(struct work_struct *work)
 {
@@ -454,19 +492,41 @@ static void hwsim_connect_work_fn(struct work_struct *work)
 		return;
 	}
 
+	/* Idempotency: skip if already associated (wpa_supplicant may
+	 * fire bsscfg:join multiple times during scan retries).
+	 */
+	if (dev->associated) {
+		mutex_unlock(&dev->lock);
+		return;
+	}
+
 	dev->fi.event_count++;
 	dev->associated = true;
 
-	/* Send BRCMF_E_LINK with LINK flag set */
+	/* (1) STA-side SET_SSID(SUCCESS, addr=AP_MAC) drives connect_done. */
+	skb = hwsim_alloc_event_skb(dev, BRCMF_E_SET_SSID,
+				    BRCMF_E_STATUS_SUCCESS, 0, 0,
+				    (const u8 *)HWSIM_AP_MAC, 0,
+				    NULL, 0);
+	if (skb)
+		hwsim_send_event(dev, skb);
+
+	/* (2) STA-side LINK(up). For non-FWSUP this is a noop in is_linkup,
+	 * but it sets carrier-up correctly through brcmf_net_setcarrier()
+	 * code path on real firmware; safe to emit.
+	 */
 	skb = hwsim_alloc_event_skb(dev, BRCMF_E_LINK,
 				    BRCMF_E_STATUS_SUCCESS, 0,
 				    BRCMF_EVENT_MSG_LINK,
 				    (const u8 *)HWSIM_AP_MAC, 0,
 				    NULL, 0);
-	mutex_unlock(&dev->lock);
-
 	if (skb)
 		hwsim_send_event(dev, skb);
+
+	/* (3) AP-side ASSOC_IND so hostapd's cfg80211 path runs new_sta. */
+	hwsim_emit_assoc_ind(dev);
+
+	mutex_unlock(&dev->lock);
 }
 
 /* ======================================================================
@@ -672,6 +732,19 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 		/* Report 20 dBm (qdbm = dBm * 4) */
 		__le32 val = cpu_to_le32(80);
 		hwsim_build_ok(dev, req, &val, sizeof(val));
+		return 0;
+	}
+
+	/* M2-D: brcmf_get_assoc_ies() expects this struct on connect_done().
+	 * Returning req_len=0/resp_len=0 makes the driver skip the follow-on
+	 * iovar GETs for assoc_req_ies / assoc_resp_ies / wme_ac_sta.
+	 */
+	if (strcmp(iovar, "assoc_info") == 0) {
+		struct brcmf_cfg80211_assoc_ielen_le info = {
+			.req_len  = cpu_to_le32(0),
+			.resp_len = cpu_to_le32(0),
+		};
+		hwsim_build_ok(dev, req, &info, sizeof(info));
 		return 0;
 	}
 
