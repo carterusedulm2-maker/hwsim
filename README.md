@@ -7,6 +7,8 @@ Two-component mock stack that lets Linux 6.12.81 `brcmfmac` driver enumerate, `p
 | `sim_sdio.c` (Kconfig: `CONFIG_BRCMFMAC_HWSIM_SDIO`) | In-driver bus shim replacing the real SDIO bus layer. Registers a platform_device + calls `brcmf_attach()`. |
 | `brcmfmac_hwsim.ko` (`drivers/.../brcmfmac/hwsim/`) | Standalone virtual firmware module. Handles BCDC ioctls, generates events, simulates interrupts, supports loopback + debugfs fault injection. |
 
+> **Companion kernel tree:** [carterusedulm2-maker/linux-6.12.81-hwsim](https://github.com/carterusedulm2-maker/linux-6.12.81-hwsim) — Linux 6.12.81 with the patches in `patches/` already applied (branch `hwsim-dev`).
+
 ## Repository layout
 
 ```
