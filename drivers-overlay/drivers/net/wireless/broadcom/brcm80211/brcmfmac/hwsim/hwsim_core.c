@@ -135,6 +135,10 @@ struct hwsim_dev {
 	struct delayed_work if_add_work;
 	struct workqueue_struct *wq;
 
+	/* M2-E: data-plane loopback queue (TX from one vif → RX on the other) */
+	struct sk_buff_head loopback_q;
+	struct work_struct loopback_work;
+
 	/* M2-A: virtual AP interface state */
 	bool ap_iface_created;
 	u8 ap_iface_mac[ETH_ALEN];
@@ -1304,9 +1308,39 @@ static int hwsim_rx_ctl(void *ctx, u8 *msg, uint len)
 	return copy_len;
 }
 
+/* ======================================================================
+ * M2-E: data-plane loopback (TX from STA → RX on AP, and vice versa)
+ *
+ * tx_data is invoked from netdev ndo_start_xmit (often soft-IRQ).
+ * brcmf_rx_frame() may sleep (GFP_KERNEL inside fweh), so we MUST
+ * defer to a workqueue. Each loopback skb is a copy of the TX skb
+ * with the BCDC ifidx rewritten to the destination interface.
+ * ====================================================================== */
+
+#define HWSIM_BCDC_FLAG_SUM_GOOD	0x04
+#define HWSIM_BCDC_FLAG2_IF_MASK	0x0f
+
+static void hwsim_loopback_work_fn(struct work_struct *work)
+{
+	struct hwsim_dev *dev = container_of(work, struct hwsim_dev,
+					     loopback_work);
+	struct sk_buff *skb;
+
+	while ((skb = skb_dequeue(&dev->loopback_q)) != NULL) {
+		if (dev->detached || !dev->cb_registered ||
+		    !dev->cb || !dev->cb->rx_data) {
+			dev_kfree_skb_any(skb);
+			continue;
+		}
+		dev->cb->rx_data(dev->cb_ctx, skb);
+	}
+}
+
 static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
 {
 	struct hwsim_dev *dev = ctx;
+	struct sk_buff *clone;
+	u8 src_ifidx, dst_ifidx;
 
 	if (!dev || dev->fw_state != HWSIM_FW_BOOTED)
 		return -ENODEV;
@@ -1322,11 +1356,47 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
 	    (get_random_u32() % 100) < dev->fi.txdata_drop_pct)
 		return 0; /* silently drop */
 
+	/* Need at least BCDC(4) + eth(14) for any sensible loopback */
+	if (skb->len < 4 + ETH_HLEN)
+		return 0;
+
+	src_ifidx = skb->data[2] & HWSIM_BCDC_FLAG2_IF_MASK;
+
+	/* Determine target ifidx. Both vifs live on the same hwsim_dev. */
+	if (src_ifidx == 0 && dev->ap_iface_created && dev->ap_started) {
+		dst_ifidx = dev->ap_iface_ifidx;
+	} else if (dev->ap_iface_created &&
+		   src_ifidx == dev->ap_iface_ifidx) {
+		dst_ifidx = 0;
+	} else {
+		/* Pre-association traffic (IPv6 MLD, mDNS, ...) → sink */
+		return 0;
+	}
+
+	/* STA→AP traffic only after STA associated (avoid early garbage). */
+	if (src_ifidx == 0 && !dev->associated)
+		return 0;
+
+	clone = skb_copy(skb, GFP_ATOMIC);
+	if (!clone)
+		return 0;
+
 	/*
-	 * M2-B: data-plane is sink-only. Per-BSS routing is M2-E.
-	 * Echoing back into brcmf_rx_frame on un-associated traffic
-	 * panics in brcmf_fws_rxreorder (e.g. on early IPv6 MLD bursts).
+	 * The TX skb's control block (skb->cb) carries netdev/qdisc state.
+	 * On the RX path it is reinterpreted as `brcmf_skb_reorder_data`;
+	 * stale bytes there falsely flag the packet as a reorder skb and
+	 * crash brcmf_fws_rxreorder.  Real bus drivers hand a freshly DMA'd
+	 * skb (cb cleared) — emulate that.
 	 */
+	memset(clone->cb, 0, sizeof(clone->cb));
+
+	/* Rewrite BCDC ifidx and mark checksum good (we don't TX-checksum). */
+	clone->data[2] = (clone->data[2] & ~HWSIM_BCDC_FLAG2_IF_MASK) |
+			 (dst_ifidx & HWSIM_BCDC_FLAG2_IF_MASK);
+	clone->data[0] |= HWSIM_BCDC_FLAG_SUM_GOOD;
+
+	skb_queue_tail(&dev->loopback_q, clone);
+	queue_work(dev->wq, &dev->loopback_work);
 	return 0;
 }
 
@@ -1361,6 +1431,8 @@ static void hwsim_detach(void *ctx)
 	cancel_delayed_work_sync(&dev->connect_work);
 	cancel_delayed_work_sync(&dev->disconnect_work);
 	cancel_delayed_work_sync(&dev->if_add_work);
+	cancel_work_sync(&dev->loopback_work);
+	skb_queue_purge(&dev->loopback_q);
 
 	pr_info("brcmfmac_hwsim: detached\n");
 }
@@ -1532,6 +1604,8 @@ static struct hwsim_dev *hwsim_dev_alloc(void)
 	INIT_DELAYED_WORK(&dev->connect_work, hwsim_connect_work_fn);
 	INIT_DELAYED_WORK(&dev->disconnect_work, hwsim_disconnect_work_fn);
 	INIT_DELAYED_WORK(&dev->if_add_work, hwsim_if_add_work_fn);
+	skb_queue_head_init(&dev->loopback_q);
+	INIT_WORK(&dev->loopback_work, hwsim_loopback_work_fn);
 
 	dev->wq = alloc_ordered_workqueue("brcmfmac_hwsim", 0);
 	if (!dev->wq) {
@@ -1551,6 +1625,8 @@ static void hwsim_dev_free(struct hwsim_dev *dev)
 	cancel_delayed_work_sync(&dev->connect_work);
 	cancel_delayed_work_sync(&dev->disconnect_work);
 	cancel_delayed_work_sync(&dev->if_add_work);
+	cancel_work_sync(&dev->loopback_work);
+	skb_queue_purge(&dev->loopback_q);
 	if (dev->wq)
 		destroy_workqueue(dev->wq);
 	kfree(dev);

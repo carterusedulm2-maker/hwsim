@@ -134,8 +134,45 @@ else
   fail "AP all_sta empty"
 fi
 
-# M2-D disconnect path: wpa_cli disconnect → BRCMF_C_DISASSOC →
-# expect STA wpa_state to leave COMPLETED and AP all_sta to empty.
+log "Phase 7: M2-E — data-plane loopback (RX-counter verification)"
+# Linux routes traffic to local IPs via 'lo', so a normal ping won't hit the
+# wireless TX path. Instead, we directly verify the loopback by:
+#  1. Recording wlan1 RX byte counter
+#  2. Forcing a frame from wlan0 (via arping to a non-local IP)
+#  3. Checking that wlan1 RX bytes increased
+ip addr add 10.99.0.1/24 dev wlan1 2>/dev/null || true
+ip addr add 10.99.0.2/24 dev wlan0 2>/dev/null || true
+sleep 1
+RX_BEFORE=$(cat /sys/class/net/wlan1/statistics/rx_bytes)
+TX_BEFORE=$(cat /sys/class/net/wlan0/statistics/tx_bytes)
+# Send ARP probes from wlan0 — they'll go through brcmf TX → hwsim_tx_data
+# → loopback → wlan1 RX path.
+arping -c 3 -w 2 -I wlan0 10.99.0.99 >/dev/null 2>&1 || true
+sleep 1
+RX_AFTER=$(cat /sys/class/net/wlan1/statistics/rx_bytes)
+TX_AFTER=$(cat /sys/class/net/wlan0/statistics/tx_bytes)
+RX_DELTA=$((RX_AFTER - RX_BEFORE))
+TX_DELTA=$((TX_AFTER - TX_BEFORE))
+if [ "$TX_DELTA" -gt 0 ] && [ "$RX_DELTA" -gt 0 ]; then
+  ok "STA→AP frames: TX wlan0 +${TX_DELTA}B → RX wlan1 +${RX_DELTA}B"
+else
+  fail "STA→AP frames: TX wlan0 +${TX_DELTA}B → RX wlan1 +${RX_DELTA}B"
+fi
+# Reverse direction
+RX_BEFORE=$(cat /sys/class/net/wlan0/statistics/rx_bytes)
+TX_BEFORE=$(cat /sys/class/net/wlan1/statistics/tx_bytes)
+arping -c 3 -w 2 -I wlan1 10.99.0.99 >/dev/null 2>&1 || true
+sleep 1
+RX_AFTER=$(cat /sys/class/net/wlan0/statistics/rx_bytes)
+TX_AFTER=$(cat /sys/class/net/wlan1/statistics/tx_bytes)
+RX_DELTA=$((RX_AFTER - RX_BEFORE))
+TX_DELTA=$((TX_AFTER - TX_BEFORE))
+if [ "$TX_DELTA" -gt 0 ] && [ "$RX_DELTA" -gt 0 ]; then
+  ok "AP→STA frames: TX wlan1 +${TX_DELTA}B → RX wlan0 +${RX_DELTA}B"
+else
+  fail "AP→STA frames: TX wlan1 +${TX_DELTA}B → RX wlan0 +${RX_DELTA}B"
+fi
+log "Phase 8: M2-D — disconnect path"
 wpa_cli -i wlan0 disconnect >/dev/null
 DISC_OK=0
 for i in 1 2 3 4 5 6 7 8; do
@@ -160,7 +197,7 @@ else
   fail "AP still has STA after disconnect: $STA_LIST"
 fi
 
-log "Phase 7: dmesg cleanliness"
+log "Phase 9: dmesg cleanliness"
 BAD=$(dmesg | grep -iE 'WARN|BUG:|oops|null deref|unable to handle|panic|RIP:|Call Trace' || true)
 if [ -z "$BAD" ]; then
   ok "dmesg clean"
