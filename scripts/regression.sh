@@ -16,6 +16,8 @@
 set -u
 SSID="${SSID:-brcmsim}"
 CHAN="${CHAN:-1}"
+M2F="${M2F:-0}"
+PSK="${PSK:-testpassword12345}"
 PASS=0
 FAIL=0
 
@@ -72,7 +74,7 @@ ip link set wlan1 up
 sleep 1
 ip link show wlan1 >/dev/null 2>&1 && ok "wlan1 created" || { fail "wlan1 missing"; exit 1; }
 
-log "Phase 3: M2-B — start hostapd on wlan1"
+log "Phase 3: M2-B — start hostapd on wlan1 ${M2F:+(WPA2-PSK mode)}"
 cat > /tmp/regr_hostapd.conf <<HC
 interface=wlan1
 driver=nl80211
@@ -81,6 +83,15 @@ ssid=$SSID
 hw_mode=g
 channel=$CHAN
 HC
+if [ "$M2F" = "1" ]; then
+  cat >> /tmp/regr_hostapd.conf <<HC
+wpa=2
+wpa_passphrase=$PSK
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+ieee80211w=0
+HC
+fi
 hostapd -B -P /tmp/regr_hostapd.pid /tmp/regr_hostapd.conf >/tmp/regr_hostapd.log 2>&1
 for i in 1 2 3 4 5 6 7 8 9 10; do
   hostapd_cli -i wlan1 status 2>/dev/null | grep -q "state=ENABLED" && break
@@ -112,7 +123,15 @@ log "Phase 6: M2-D — STA association to brcmsim AP"
 # Add brcmsim network and trigger reconnect
 NETID=$(wpa_cli -i wlan0 add_network 2>/dev/null | tail -1)
 wpa_cli -i wlan0 set_network "$NETID" ssid "\"$SSID\"" >/dev/null
-wpa_cli -i wlan0 set_network "$NETID" key_mgmt NONE  >/dev/null
+if [ "$M2F" = "1" ]; then
+  wpa_cli -i wlan0 set_network "$NETID" key_mgmt WPA-PSK >/dev/null
+  wpa_cli -i wlan0 set_network "$NETID" psk "\"$PSK\""   >/dev/null
+  wpa_cli -i wlan0 set_network "$NETID" proto RSN        >/dev/null
+  wpa_cli -i wlan0 set_network "$NETID" pairwise CCMP    >/dev/null
+  wpa_cli -i wlan0 set_network "$NETID" ieee80211w 0     >/dev/null
+else
+  wpa_cli -i wlan0 set_network "$NETID" key_mgmt NONE  >/dev/null
+fi
 wpa_cli -i wlan0 set_network "$NETID" scan_ssid 1    >/dev/null
 wpa_cli -i wlan0 enable_network "$NETID" >/dev/null
 wpa_cli -i wlan0 reconnect >/dev/null
@@ -126,6 +145,14 @@ if [ "$ASSOC_OK" = "1" ]; then
   ok "wpa_state=COMPLETED at t=${i}s"
 else
   fail "wpa_state never reached COMPLETED (last=$ST)"
+fi
+if [ "$M2F" = "1" ]; then
+  KEYMGMT=$(wpa_cli -i wlan0 status 2>/dev/null | awk -F= '/^key_mgmt/{print $2}')
+  if [ "$KEYMGMT" = "WPA2-PSK" ]; then
+    ok "key_mgmt=$KEYMGMT (WPA2-PSK 4-way handshake done)"
+  else
+    fail "key_mgmt=$KEYMGMT (expected WPA2-PSK)"
+  fi
 fi
 STA_LIST=$(hostapd_cli -i wlan1 all_sta 2>/dev/null)
 if echo "$STA_LIST" | grep -qE '^[0-9a-f:]{17}$'; then

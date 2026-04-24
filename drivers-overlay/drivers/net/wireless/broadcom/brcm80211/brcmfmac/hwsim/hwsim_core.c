@@ -21,6 +21,7 @@
 #include <linux/jiffies.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/unaligned.h>
 
 #include <brcmu_wifi.h>
 #include "core.h"
@@ -60,7 +61,7 @@ struct hwsim_bcdc_dcmd {
 
 /* Simulated device constants */
 #define HWSIM_MAC_ADDR		"\x02\x00\x00\x48\x53\x00"
-#define HWSIM_AP_MAC		"\x02\x00\x00\x48\x53\x10"
+#define HWSIM_AP_MAC		"\x02\x00\x00\xe8\x53\x00"
 #define HWSIM_AP_SSID		"HWSIM-AP"
 #define HWSIM_AP_CHANNEL	1
 /* D11AC chanspec encoding: ch | BW_20 (0x1000) | BND_2G (0x0000) */
@@ -145,6 +146,13 @@ struct hwsim_dev {
 	u8 ap_iface_ifidx;
 	u8 ap_iface_bsscfgidx;
 
+	/* M2-F: WPA2-PSK userspace 4-way state (per-bsscfg, idx 0=STA, 1=AP).
+	 * Stored on SET wpa_auth/wsec/wsec_primary_key, returned on GET.
+	 */
+	u32 wpa_auth[2];
+	u32 wsec[2];
+	u32 wsec_primary_key[2];
+
 	/* Fault injection state (Phase 17) */
 	struct {
 		u32 force_ioctl_error;   /* non-zero → all ioctls return this BCME code */
@@ -184,6 +192,42 @@ static const char *hwsim_extract_iovar(const u8 *payload, uint len)
 			return (const char *)payload;
 	}
 	return NULL;
+}
+
+/* For "bsscfg:<name>" iovars, peel the prefix and return:
+ *   - name     : pointer to the unprefixed iovar name
+ *   - bsscfgidx: parsed from the 4 bytes after the name's NUL
+ *   - val_ptr  : pointer to the iovar payload past name+NUL+bsscfgidx
+ *   - val_len  : remaining length
+ * For non-bsscfg iovars, returns iovar unchanged with bsscfgidx=0 and val_ptr
+ * after name+NUL.
+ */
+static const char *hwsim_peel_bsscfg(const char *iovar, const u8 *payload,
+				     uint payload_len, u8 *bsscfgidx,
+				     const u8 **val_ptr, uint *val_len)
+{
+	const char *name = iovar;
+	uint name_len;
+	uint off;
+
+	*bsscfgidx = 0;
+	if (strncmp(iovar, "bsscfg:", 7) == 0) {
+		name = iovar + 7;
+		name_len = strlen(iovar) + 1;  /* including "bsscfg:" prefix and NUL */
+		off = name_len;
+		if (payload_len >= off + 4) {
+			__le32 idx_le;
+			memcpy(&idx_le, payload + off, sizeof(idx_le));
+			*bsscfgidx = le32_to_cpu(idx_le) & 0xff;
+			off += 4;
+		}
+	} else {
+		name_len = strlen(iovar) + 1;
+		off = name_len;
+	}
+	*val_ptr = payload + off;
+	*val_len = (payload_len > off) ? payload_len - off : 0;
+	return name;
 }
 
 /* ======================================================================
@@ -331,7 +375,7 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	struct brcmf_bss_info_le *bi;
 	const u8 *adv_ssid;
 	u8 adv_ssid_len;
-	u8 ie_data[2 + IEEE80211_MAX_SSID_LEN + 6];
+	u8 ie_data[2 + IEEE80211_MAX_SSID_LEN + 6 + 22];
 	int ie_len;
 	int bss_len, escan_len;
 
@@ -373,6 +417,27 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	ie_data[2 + adv_ssid_len + 5] = 0x96;
 	ie_len = 2 + adv_ssid_len + 6;
 
+	/* M2-F: if AP bsscfg has WPA2-PSK configured, append RSN IE so
+	 * cfg80211/wpa_supplicant flag the BSS as [WPA2-PSK-CCMP] and
+	 * the userspace 4-way handshake can proceed.
+	 */
+	{
+		u32 ap_wpa_auth = dev->wpa_auth[1];
+		if (ap_wpa_auth != 0) {
+			u8 *p = &ie_data[ie_len];
+			*p++ = 0x30;            /* id = 48 (RSN) */
+			*p++ = 20;              /* length */
+			*p++ = 0x01; *p++ = 0x00;                       /* version */
+			*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x04; /* group: CCMP */
+			*p++ = 0x01; *p++ = 0x00;                       /* pairwise count */
+			*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x04; /* pairwise: CCMP */
+			*p++ = 0x01; *p++ = 0x00;                       /* akm count */
+			*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x02; /* akm: PSK */
+			*p++ = 0x00; *p++ = 0x00;                       /* RSN cap */
+			ie_len += 22;
+		}
+	}
+
 	/* Partial result with 1 BSS */
 	bss_len = sizeof(struct brcmf_bss_info_le) + ie_len;
 	escan_len = sizeof(*escan) - sizeof(struct brcmf_bss_info_le) + bss_len;
@@ -397,8 +462,10 @@ static void hwsim_scan_work_fn(struct work_struct *work)
 	bi->length = cpu_to_le32(bss_len);
 	memcpy(bi->BSSID, HWSIM_AP_MAC, ETH_ALEN);
 	bi->beacon_period = cpu_to_le16(100);
-	/* Open AP: ESS | Short Preamble | Short Slot (no Privacy) */
+	/* ESS | Short Preamble | Short Slot; Privacy bit set later if WPA2 */
 	bi->capability = cpu_to_le16(0x0421);
+	if (dev->wpa_auth[1] != 0)
+		bi->capability = cpu_to_le16(0x0431); /* + Privacy bit */
 	bi->SSID_len = adv_ssid_len;
 	memcpy(bi->SSID, adv_ssid, adv_ssid_len);
 	bi->chanspec = cpu_to_le16(HWSIM_AP_CHANSPEC);
@@ -455,8 +522,12 @@ done:
 
 static void hwsim_emit_assoc_ind(struct hwsim_dev *dev)
 {
-	/* Minimal IE blob: SSID-IE so hostapd has at least one element to log. */
-	u8 ie[2 + IEEE80211_MAX_SSID_LEN];
+	/* Minimal IE blob: SSID-IE + (optional) RSN-IE. hostapd parses these
+	 * as the STA's assoc request IEs; for WPA2 it needs an RSN IE that
+	 * matches the AP's advertised cipher/AKM, otherwise the 4-way
+	 * handshake never starts.
+	 */
+	u8 ie[2 + IEEE80211_MAX_SSID_LEN + 22];
 	u32 ie_len;
 	struct sk_buff *skb;
 	u8 ap_ifidx;
@@ -470,6 +541,19 @@ static void hwsim_emit_assoc_ind(struct hwsim_dev *dev)
 	if (dev->ap_ssid_len)
 		memcpy(ie + 2, dev->ap_ssid, dev->ap_ssid_len);
 	ie_len = 2 + dev->ap_ssid_len;
+
+	if (dev->wpa_auth[1] != 0) {
+		u8 *p = &ie[ie_len];
+		*p++ = 0x30; *p++ = 20;
+		*p++ = 0x01; *p++ = 0x00;
+		*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x04;
+		*p++ = 0x01; *p++ = 0x00;
+		*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x04;
+		*p++ = 0x01; *p++ = 0x00;
+		*p++ = 0x00; *p++ = 0x0f; *p++ = 0xac; *p++ = 0x02;
+		*p++ = 0x00; *p++ = 0x00;
+		ie_len += 22;
+	}
 
 	skb = hwsim_alloc_event_skb(dev, BRCMF_E_ASSOC_IND,
 				    BRCMF_E_STATUS_SUCCESS, 0, 0,
@@ -859,9 +943,16 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 		if (flags & 0x2 /* WL_INTERFACE_MAC_USE */) {
 			memcpy(dev->ap_iface_mac, mac, ETH_ALEN);
 		} else {
+			/* Mirror brcmfmac's own AP-iface MAC derivation
+			 * (cfg80211.c:606-607: byte3 ^= 0xA0 for AP).
+			 * Both sides MUST agree: the BSSID we beacon and
+			 * the netdev MAC the kernel assigns; the WPA PTK
+			 * derivation hashes both, so any mismatch yields
+			 * "invalid MIC in msg 2/4 of 4-Way Handshake".
+			 */
 			memcpy(dev->ap_iface_mac, dev->mac_addr, ETH_ALEN);
 			dev->ap_iface_mac[0] |= 0x02;
-			dev->ap_iface_mac[5] ^= 0x10;
+			dev->ap_iface_mac[3] ^= 0xA0;
 			memcpy(mac, dev->ap_iface_mac, ETH_ALEN);
 		}
 
@@ -904,6 +995,37 @@ static int hwsim_handle_get_var(struct hwsim_dev *dev,
 		__le32 val = cpu_to_le32(dev->associated ? 1 : 0);
 		hwsim_build_ok(dev, req, &val, sizeof(val));
 		return 0;
+	}
+
+	/* M2-F: WPA2-PSK userspace 4-way — return stored per-bsscfg values.
+	 * brcmf_set_key_mgmt requires GET wpa_auth to come back with the
+	 * PSK-related bits we set during connect; otherwise it returns -EINVAL.
+	 */
+	{
+		u8 bsscfgidx = 0;
+		const u8 *vp;
+		uint vlen;
+		const char *name = hwsim_peel_bsscfg(iovar, payload, payload_len,
+						     &bsscfgidx, &vp, &vlen);
+
+		if (bsscfgidx > 1)
+			bsscfgidx = 0;
+
+		if (strcmp(name, "wpa_auth") == 0) {
+			__le32 val = cpu_to_le32(dev->wpa_auth[bsscfgidx]);
+			hwsim_build_ok(dev, req, &val, sizeof(val));
+			return 0;
+		}
+		if (strcmp(name, "wsec") == 0) {
+			__le32 val = cpu_to_le32(dev->wsec[bsscfgidx]);
+			hwsim_build_ok(dev, req, &val, sizeof(val));
+			return 0;
+		}
+		if (strcmp(name, "wsec_primary_key") == 0) {
+			__le32 val = cpu_to_le32(dev->wsec_primary_key[bsscfgidx]);
+			hwsim_build_ok(dev, req, &val, sizeof(val));
+			return 0;
+		}
 	}
 
 unsupported:
@@ -1003,6 +1125,49 @@ static int hwsim_handle_set_var(struct hwsim_dev *dev,
 	    strcmp(iovar, "wpaie") == 0) {
 		hwsim_build_ok(dev, req, NULL, 0);
 		return 0;
+	}
+
+	/* M2-F: WPA2-PSK userspace 4-way — store wpa_auth/wsec/primary_key
+	 * per-bsscfg, accept wsec_key/mfp/etc. silently. Driver retrieves the
+	 * stored values via the corresponding GET handlers below.
+	 */
+	{
+		u8 bsscfgidx = 0;
+		const u8 *vp;
+		uint vlen;
+		const char *name = hwsim_peel_bsscfg(iovar, payload, payload_len,
+						     &bsscfgidx, &vp, &vlen);
+
+		if (bsscfgidx > 1)
+			bsscfgidx = 0;
+
+		if (strcmp(name, "wpa_auth") == 0) {
+			if (vlen >= 4)
+				dev->wpa_auth[bsscfgidx] = get_unaligned_le32(vp);
+			hwsim_build_ok(dev, req, NULL, 0);
+			return 0;
+		}
+		if (strcmp(name, "wsec") == 0) {
+			if (vlen >= 4)
+				dev->wsec[bsscfgidx] = get_unaligned_le32(vp);
+			hwsim_build_ok(dev, req, NULL, 0);
+			return 0;
+		}
+		if (strcmp(name, "wsec_primary_key") == 0) {
+			if (vlen >= 4)
+				dev->wsec_primary_key[bsscfgidx] =
+					get_unaligned_le32(vp);
+			hwsim_build_ok(dev, req, NULL, 0);
+			return 0;
+		}
+		if (strcmp(name, "wsec_key") == 0 ||
+		    strcmp(name, "wpaie") == 0 ||
+		    strcmp(name, "mfp") == 0 ||
+		    strcmp(name, "auth") == 0 ||
+		    strcmp(name, "wsec_pmk") == 0) {
+			hwsim_build_ok(dev, req, NULL, 0);
+			return 0;
+		}
 	}
 
 	/* --- AP mode --- */
@@ -1222,6 +1387,75 @@ static int hwsim_handle_cmd(struct hwsim_dev *dev,
 		return 0;
 	}
 
+	case BRCMF_C_GET_BSS_INFO: {
+		/* Buffer layout: [4B len_prefix][brcmf_bss_info_le][IEs].
+		 * brcmfmac calls this after assoc to refresh BSS state; for
+		 * WPA2-PSK we must include the same RSN IE we beacon, otherwise
+		 * brcmf_inform_single_bss → cfg80211_inform_bss yields a BSS
+		 * cfg80211_get_bss() can't match → connect path stalls.
+		 */
+		u8 buf[4 + sizeof(struct brcmf_bss_info_le) + 64];
+		struct brcmf_bss_info_le *bi;
+		const u8 *adv_ssid;
+		u32 adv_ssid_len;
+		u8 *ie;
+		u32 ie_len = 0, bss_len;
+
+		memset(buf, 0, sizeof(buf));
+		bi = (struct brcmf_bss_info_le *)(buf + 4);
+
+		if (dev->ap_started && dev->ap_ssid_len > 0) {
+			adv_ssid = dev->ap_ssid;
+			adv_ssid_len = dev->ap_ssid_len;
+		} else {
+			adv_ssid = (const u8 *)HWSIM_AP_SSID;
+			adv_ssid_len = strlen(HWSIM_AP_SSID);
+		}
+
+		ie = (u8 *)bi + sizeof(*bi);
+		ie[ie_len++] = 0x00;
+		ie[ie_len++] = adv_ssid_len;
+		memcpy(&ie[ie_len], adv_ssid, adv_ssid_len);
+		ie_len += adv_ssid_len;
+		ie[ie_len++] = 0x01;
+		ie[ie_len++] = 0x04;
+		ie[ie_len++] = 0x82; ie[ie_len++] = 0x84;
+		ie[ie_len++] = 0x8b; ie[ie_len++] = 0x96;
+		if (dev->wpa_auth[1] != 0) {
+			ie[ie_len++] = 0x30; ie[ie_len++] = 20;
+			ie[ie_len++] = 0x01; ie[ie_len++] = 0x00;
+			ie[ie_len++] = 0x00; ie[ie_len++] = 0x0f;
+			ie[ie_len++] = 0xac; ie[ie_len++] = 0x04;
+			ie[ie_len++] = 0x01; ie[ie_len++] = 0x00;
+			ie[ie_len++] = 0x00; ie[ie_len++] = 0x0f;
+			ie[ie_len++] = 0xac; ie[ie_len++] = 0x04;
+			ie[ie_len++] = 0x01; ie[ie_len++] = 0x00;
+			ie[ie_len++] = 0x00; ie[ie_len++] = 0x0f;
+			ie[ie_len++] = 0xac; ie[ie_len++] = 0x02;
+			ie[ie_len++] = 0x00; ie[ie_len++] = 0x00;
+		}
+
+		bss_len = sizeof(*bi) + ie_len;
+		bi->version = cpu_to_le32(109);
+		bi->length = cpu_to_le32(bss_len);
+		memcpy(bi->BSSID, HWSIM_AP_MAC, ETH_ALEN);
+		bi->beacon_period = cpu_to_le16(100);
+		bi->capability = cpu_to_le16(dev->wpa_auth[1] ? 0x0431 : 0x0421);
+		bi->SSID_len = adv_ssid_len;
+		memcpy(bi->SSID, adv_ssid, adv_ssid_len);
+		bi->chanspec = cpu_to_le16(HWSIM_AP_CHANSPEC);
+		bi->RSSI = cpu_to_le16(HWSIM_AP_SIGNAL);
+		bi->phy_noise = -95;
+		bi->n_cap = 1;
+		bi->ctl_ch = HWSIM_AP_CHANNEL;
+		bi->ie_offset = cpu_to_le16(sizeof(*bi));
+		bi->ie_length = cpu_to_le32(ie_len);
+
+		put_unaligned_le32(4 + bss_len, buf);
+		hwsim_build_ok(dev, req, buf, 4 + bss_len);
+		return 0;
+	}
+
 	default:
 		if (is_set)
 			hwsim_build_ok(dev, req, NULL, 0);
@@ -1394,6 +1628,22 @@ static int hwsim_tx_data(void *ctx, struct sk_buff *skb)
 	clone->data[2] = (clone->data[2] & ~HWSIM_BCDC_FLAG2_IF_MASK) |
 			 (dst_ifidx & HWSIM_BCDC_FLAG2_IF_MASK);
 	clone->data[0] |= HWSIM_BCDC_FLAG_SUM_GOOD;
+
+	/* M2-F: Rewrite unicast eth dst MAC to the destination iface's actual
+	 * MAC. STA assoc's to HWSIM_AP_MAC (the BSSID we beacon), but wlan1's
+	 * netdev has a different MAC; without this rewrite, EAPOL unicast
+	 * frames fail the kernel's per-iface MAC filter and AF_PACKET (used
+	 * by hostapd/supplicant) never sees them.
+	 */
+	if (clone->len >= 4 + ETH_HLEN) {
+		u8 *eth_dst = &clone->data[4];
+		if (!(eth_dst[0] & 0x01)) { /* unicast */
+			if (dst_ifidx == 0)
+				memcpy(eth_dst, dev->mac_addr, ETH_ALEN);
+			else if (dev->ap_iface_created)
+				memcpy(eth_dst, dev->ap_iface_mac, ETH_ALEN);
+		}
+	}
 
 	skb_queue_tail(&dev->loopback_q, clone);
 	queue_work(dev->wq, &dev->loopback_work);
